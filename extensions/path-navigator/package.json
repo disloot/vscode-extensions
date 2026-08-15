@@ -2,8 +2,9 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "Disloot",
+  "icon": "resources/icon.png",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
