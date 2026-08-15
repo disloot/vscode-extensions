@@ -3,8 +3,17 @@
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
   "version": "0.1.0",
-  "publisher": "local",
-  "license": "MIT",
+  "publisher": "Disloot",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/disloot/vscode-extensions.git",
+    "directory": "extensions/path-navigator"
+  },
+  "homepage": "https://github.com/disloot/vscode-extensions/tree/main/extensions/path-navigator",
+  "bugs": {
+    "url": "https://github.com/disloot/vscode-extensions/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
