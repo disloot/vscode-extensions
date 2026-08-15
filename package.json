@@ -1,0 +1,15 @@
+{
+  "name": "vscode-extensions",
+  "private": true,
+  "description": "A monorepo for personal VS Code extensions.",
+  "workspaces": [
+    "extensions/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "compile": "npm run compile --workspaces --if-present",
+    "check": "npm run check --workspaces --if-present",
+    "test": "npm test --workspaces --if-present",
+    "package:path-navigator": "npm run vscode:prepublish --workspace extensions/path-navigator"
+  }
+}

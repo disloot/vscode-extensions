@@ -1,0 +1,115 @@
+{
+  "name": "path-navigator",
+  "displayName": "Path Navigator",
+  "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "path",
+    "file",
+    "folder",
+    "quick open",
+    "navigation"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": true
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "pathNavigator.open",
+        "title": "Open File or Reveal Directory",
+        "category": "Path Navigator"
+      },
+      {
+        "command": "pathNavigator.refreshIndex",
+        "title": "Refresh Path Index",
+        "category": "Path Navigator",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "pathNavigator.completePath",
+        "title": "Complete Selected Path",
+        "category": "Path Navigator"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "pathNavigator.completePath",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "pathNavigator.open",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p"
+      },
+      {
+        "command": "pathNavigator.completePath",
+        "key": "tab",
+        "when": "pathNavigator.active"
+      }
+    ],
+    "configuration": {
+      "title": "Path Navigator",
+      "properties": {
+        "pathNavigator.maxResults": {
+          "type": "number",
+          "default": 200,
+          "minimum": 20,
+          "maximum": 2000,
+          "description": "Maximum number of matching files and directories shown in the picker."
+        },
+        "pathNavigator.excludeDirectoryNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            ".git",
+            "node_modules",
+            ".next",
+            ".turbo",
+            "coverage",
+            "dist",
+            "out",
+            "build"
+          ],
+          "description": "Directory names that are excluded from the path index."
+        },
+        "pathNavigator.openFilesInPreview": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open selected files as preview editors instead of pinned tabs."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "test": "npm run compile && node --test test/*.test.js",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.9.0"
+  }
+}
