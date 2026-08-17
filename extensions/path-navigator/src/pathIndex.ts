@@ -2,9 +2,17 @@ import * as vscode from 'vscode';
 import { PathEntry } from './pathEntry';
 
 interface IndexSnapshot {
-  readonly entries: readonly PathEntry[];
   readonly errors: readonly string[];
 }
+
+interface PendingDirectory {
+  readonly uri: vscode.Uri;
+  readonly relativePath: string;
+}
+
+const MAX_CONCURRENT_DIRECTORY_READS = 12;
+const PROGRESS_ENTRY_BATCH_SIZE = 250;
+const PROGRESS_INTERVAL_MS = 100;
 
 export class PathIndex implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
@@ -67,92 +75,158 @@ export class PathIndex implements vscode.Disposable {
 
   private async build(requestedGeneration: number): Promise<void> {
     this.setBuilding(true);
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    const excludedNames = new Set(
-      vscode.workspace
-        .getConfiguration('pathNavigator')
-        .get<string[]>('excludeDirectoryNames', [])
-        .map((name) => name.toLocaleLowerCase()),
-    );
+    try {
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      const excludedNames = new Set(
+        vscode.workspace
+          .getConfiguration('pathNavigator')
+          .get<string[]>('excludeDirectoryNames', [])
+          .map((name) => name.toLocaleLowerCase()),
+      );
+      const collectedEntries: PathEntry[] = [];
+      let publishedEntryCount = 0;
+      let lastPublishedAt = 0;
 
-    const snapshots = await Promise.all(
-      folders.map((folder) => this.scanWorkspaceFolder(folder, excludedNames)),
-    );
+      const publishProgress = (force = false): void => {
+        if (requestedGeneration !== this.generation) {
+          return;
+        }
 
-    if (requestedGeneration !== this.generation) {
-      return;
-    }
+        const now = Date.now();
+        const addedEntryCount = collectedEntries.length - publishedEntryCount;
+        if (
+          !force &&
+          publishedEntryCount > 0 &&
+          addedEntryCount < PROGRESS_ENTRY_BATCH_SIZE &&
+          now - lastPublishedAt < PROGRESS_INTERVAL_MS
+        ) {
+          return;
+        }
 
-    this.entries = snapshots.flatMap((snapshot) => snapshot.entries);
-    this.changeEmitter.fire();
-    this.setBuilding(false);
+        this.entries = [...collectedEntries];
+        publishedEntryCount = collectedEntries.length;
+        lastPublishedAt = now;
+        this.changeEmitter.fire();
+      };
 
-    const errors = snapshots.flatMap((snapshot) => snapshot.errors);
-    if (errors.length > 0) {
-      const suffix = errors.length === 1 ? errors[0] : `${errors.length} directories could not be read.`;
-      void vscode.window.showWarningMessage(`Path Navigator index is incomplete: ${suffix}`);
+      const snapshots = await Promise.all(
+        folders.map((folder) =>
+          this.scanWorkspaceFolder(
+            folder,
+            excludedNames,
+            (entries) => {
+              collectedEntries.push(...entries);
+              publishProgress();
+            },
+            () => requestedGeneration === this.generation,
+          ),
+        ),
+      );
+
+      if (requestedGeneration !== this.generation) {
+        return;
+      }
+
+      publishProgress(true);
+
+      const errors = snapshots.flatMap((snapshot) => snapshot.errors);
+      if (errors.length > 0) {
+        const suffix =
+          errors.length === 1 ? errors[0] : `${errors.length} directories could not be read.`;
+        void vscode.window.showWarningMessage(`Path Navigator index is incomplete: ${suffix}`);
+      }
+    } finally {
+      if (requestedGeneration === this.generation) {
+        this.setBuilding(false);
+      }
     }
   }
 
   private async scanWorkspaceFolder(
     workspaceFolder: vscode.WorkspaceFolder,
     excludedNames: ReadonlySet<string>,
+    onEntries: (entries: readonly PathEntry[]) => void,
+    shouldContinue: () => boolean,
   ): Promise<IndexSnapshot> {
-    const entries: PathEntry[] = [];
     const errors: string[] = [];
-    const queue: Array<{ uri: vscode.Uri; relativePath: string }> = [
+    let directories: PendingDirectory[] = [
       { uri: workspaceFolder.uri, relativePath: '' },
     ];
 
-    for (let index = 0; index < queue.length; index += 1) {
-      const directory = queue[index];
-      let children: [string, vscode.FileType][];
+    while (directories.length > 0 && shouldContinue()) {
+      const currentLevel = directories;
+      const nextLevel: PendingDirectory[] = [];
+      let nextDirectoryIndex = 0;
 
-      try {
-        children = await vscode.workspace.fs.readDirectory(directory.uri);
-      } catch (error) {
-        errors.push(`${directory.uri.toString()}: ${String(error)}`);
-        continue;
-      }
+      const scanNextDirectory = async (): Promise<void> => {
+        while (shouldContinue()) {
+          const directory = currentLevel[nextDirectoryIndex];
+          nextDirectoryIndex += 1;
+          if (!directory) {
+            return;
+          }
 
-      for (const [name, fileType] of children) {
-        const relativePath = directory.relativePath
-          ? `${directory.relativePath}/${name}`
-          : name;
-        const uri = vscode.Uri.joinPath(directory.uri, name);
-        const isDirectory = (fileType & vscode.FileType.Directory) !== 0;
-        const isSymbolicLink = (fileType & vscode.FileType.SymbolicLink) !== 0;
-
-        if (isDirectory) {
-          if (excludedNames.has(name.toLocaleLowerCase())) {
+          let children: [string, vscode.FileType][];
+          try {
+            children = await vscode.workspace.fs.readDirectory(directory.uri);
+          } catch (error) {
+            errors.push(`${directory.uri.toString()}: ${String(error)}`);
             continue;
           }
-          entries.push({
-            uri,
-            kind: 'directory',
-            name,
-            relativePath,
-            workspaceName: workspaceFolder.name,
-            workspaceUri: workspaceFolder.uri.toString(),
-          });
-          if (!isSymbolicLink) {
-            queue.push({ uri, relativePath });
-          }
-          continue;
-        }
 
-        entries.push({
-          uri,
-          kind: 'file',
-          name,
-          relativePath,
-          workspaceName: workspaceFolder.name,
-          workspaceUri: workspaceFolder.uri.toString(),
-        });
-      }
+          if (!shouldContinue()) {
+            return;
+          }
+
+          const discoveredEntries: PathEntry[] = [];
+          for (const [name, fileType] of children) {
+            const relativePath = directory.relativePath
+              ? `${directory.relativePath}/${name}`
+              : name;
+            const uri = vscode.Uri.joinPath(directory.uri, name);
+            const isDirectory = (fileType & vscode.FileType.Directory) !== 0;
+            const isSymbolicLink = (fileType & vscode.FileType.SymbolicLink) !== 0;
+
+            if (isDirectory) {
+              if (excludedNames.has(name.toLocaleLowerCase())) {
+                continue;
+              }
+              discoveredEntries.push({
+                uri,
+                kind: 'directory',
+                name,
+                relativePath,
+                workspaceName: workspaceFolder.name,
+                workspaceUri: workspaceFolder.uri.toString(),
+              });
+              if (!isSymbolicLink) {
+                nextLevel.push({ uri, relativePath });
+              }
+              continue;
+            }
+
+            discoveredEntries.push({
+              uri,
+              kind: 'file',
+              name,
+              relativePath,
+              workspaceName: workspaceFolder.name,
+              workspaceUri: workspaceFolder.uri.toString(),
+            });
+          }
+
+          if (discoveredEntries.length > 0) {
+            onEntries(discoveredEntries);
+          }
+        }
+      };
+
+      const workerCount = Math.min(MAX_CONCURRENT_DIRECTORY_READS, currentLevel.length);
+      await Promise.all(Array.from({ length: workerCount }, () => scanNextDirectory()));
+      directories = nextLevel;
     }
 
-    return { entries, errors };
+    return { errors };
   }
 
   private resetWatchers(): void {

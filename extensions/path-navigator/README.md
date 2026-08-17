@@ -41,6 +41,18 @@ cd  → Tab → abc/bcd/cde
 The refresh button in the picker rebuilds the path index. You can also run
 **Path Navigator: Refresh Path Index**.
 
+## Remote workspaces
+
+Path Navigator runs as a workspace extension, so Remote SSH, Dev Containers,
+WSL, and Codespaces execute its indexer alongside the workspace. Remote indexes
+are built concurrently and publish partial results while the remaining folders
+are still being scanned.
+
+To test a local VSIX, first connect to the remote environment, then run
+**Extensions: Install from VSIX...** in that remote window and reload it. Use
+**Developer: Show Running Extensions** to confirm that Path Navigator is running
+in the remote extension host.
+
 ## Replace Cmd+P
 
 VS Code does not provide an API for adding directories to its built-in `Cmd+P`
