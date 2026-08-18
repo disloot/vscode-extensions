@@ -26,6 +26,8 @@ workspace-relative paths.
 - Restore a streamed compressed index on startup and reconcile it in the background.
 - Optionally build a shallow initial index and load a directory subtree when it is entered.
 - Optionally accelerate full scans with Git, fd, or ripgrep on the workspace host.
+- Learn measured backend throughput per workspace when `indexingBackend` is `auto`.
+- Tune Remote SSH and Dev Container directory-read concurrency without exceeding its configured maximum.
 - Support multi-root, remote, and virtual workspaces through `workspace.fs`.
 
 ## Usage
@@ -130,12 +132,15 @@ the Keyboard Shortcuts editor.
 - `pathNavigator.indexConcurrency`: concurrent directory reads from a shared work queue
   during indexing
   (default `12`; lower values may suit constrained remote workspaces).
+- `pathNavigator.adaptiveRemoteConcurrency`: ramp remote concurrency toward the configured
+  maximum and back off when latency indicates congestion (default `true`).
 - `pathNavigator.autoRefreshIndex`: apply incremental file/directory updates
   (default `true`).
 - `pathNavigator.incrementalUpdateBatchLimit`: maximum coalesced file events handled
   incrementally before falling back to a full rebuild (default `2000`).
 - `pathNavigator.indexingBackend`: use portable `workspaceFs` (default), or opt into
-  `auto`, `git`, `fd`, or `rg` for faster command-line-backed full scans.
+  adaptive `auto`, `git`, `fd`, or `rg`. Auto remembers normalized throughput for each
+  workspace; before measurements exist its external order is `fd → rg → git`.
 - `pathNavigator.initialIndexDepth`: initial `workspace.fs` scan depth (`0` means a
   complete index). Positive values load entered directory subtrees on demand.
 - `pathNavigator.persistIndex`: restore a compressed binary index when reopening a

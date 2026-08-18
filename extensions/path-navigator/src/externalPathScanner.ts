@@ -17,6 +17,7 @@ export interface ExternalScanOptions {
   readonly excludedNames: ReadonlySet<string>;
   readonly excludedFileExtensions: ReadonlySet<string>;
   readonly initialDepth: number;
+  readonly preferredBackends?: readonly Exclude<IndexingBackend, 'workspaceFs' | 'auto'>[];
   readonly shouldContinue: () => boolean;
   readonly onPaths: (paths: readonly ScannedExternalPath[]) => void;
 }
@@ -24,6 +25,8 @@ export interface ExternalScanOptions {
 export interface ExternalScanResult {
   readonly handled: boolean;
   readonly backend?: Exclude<IndexingBackend, 'workspaceFs' | 'auto'>;
+  readonly durationMs?: number;
+  readonly pathCount?: number;
   readonly error?: string;
 }
 
@@ -152,10 +155,14 @@ export async function scanWithExternalBackend(
     return { handled: false };
   }
   const candidates: Array<Exclude<IndexingBackend, 'workspaceFs' | 'auto'>> =
-    options.backend === 'auto' ? ['git', 'fd', 'rg'] : [options.backend];
+    options.backend === 'auto'
+      ? [...(options.preferredBackends ?? ['fd', 'rg', 'git'])]
+      : [options.backend];
   let lastError: string | undefined;
 
   for (const backend of candidates) {
+    const startedAt = performance.now();
+    let emittedPathCount = 0;
     const pendingBatch: ScannedExternalPath[] = [];
     const seenDirectories = new Set<string>();
     const flush = (): void => {
@@ -192,6 +199,7 @@ export async function scanWithExternalBackend(
         seenDirectories.add(normalizedPath);
       }
       pendingBatch.push({ relativePath: normalizedPath, kind });
+      emittedPathCount += 1;
       if (pendingBatch.length >= OUTPUT_BATCH_SIZE) {
         flush();
       }
@@ -219,7 +227,12 @@ export async function scanWithExternalBackend(
       );
       if (!options.shouldContinue()) {
         flush();
-        return { handled: true, backend };
+        return {
+          handled: true,
+          backend,
+          durationMs: performance.now() - startedAt,
+          pathCount: emittedPathCount,
+        };
       }
       if (!result.success) {
         success = false;
@@ -229,7 +242,12 @@ export async function scanWithExternalBackend(
     }
     flush();
     if (success) {
-      return { handled: true, backend };
+      return {
+        handled: true,
+        backend,
+        durationMs: performance.now() - startedAt,
+        pathCount: emittedPathCount,
+      };
     }
   }
   return { handled: false, error: lastError };

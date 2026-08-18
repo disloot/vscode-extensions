@@ -111,13 +111,14 @@ export function scorePathWithNormalizedQuery(
   item: SearchablePath,
   query: string,
   fuzzyMatching = true,
+  normalizedWorkspaceName?: string,
 ): number | undefined {
   if (!query) {
     return item.kind === 'directory' ? 10 : 0;
   }
 
   const path = item.normalizedPath ?? normalizeSearchText(item.relativePath);
-  const name = item.normalizedName ?? normalizeSearchText(item.name);
+  const name = item.normalizedName ?? path.slice(path.lastIndexOf('/') + 1);
 
   if (path === query) {
     return 10_000;
@@ -142,7 +143,10 @@ export function scorePathWithNormalizedQuery(
     return 7_000 - pathIndex - path.length * 0.1;
   }
 
-  const workspace = item.normalizedWorkspaceName ?? normalizeSearchText(item.workspaceName);
+  const workspace =
+    normalizedWorkspaceName ??
+    item.normalizedWorkspaceName ??
+    normalizeSearchText(item.workspaceName);
   const searchablePath = `${workspace}/${path}`;
   if (searchablePath === query) {
     return 10_000;

@@ -16,6 +16,7 @@ export type PathEntryId = number;
 
 interface WorkspaceCatalog {
   readonly uri: string;
+  readonly normalizedWorkspaceName: string;
   entryIds: IdBucket | undefined;
   readonly idsByNormalizedPath: BucketMap;
   readonly childrenByParent: BucketMap;
@@ -152,9 +153,10 @@ function uniqueNgrams(value: string, size: number): Set<string> {
   return grams;
 }
 
-function createWorkspaceCatalog(uri: string): WorkspaceCatalog {
+function createWorkspaceCatalog(uri: string, normalizedWorkspaceName: string): WorkspaceCatalog {
   return {
     uri,
+    normalizedWorkspaceName,
     entryIds: undefined,
     idsByNormalizedPath: new Map(),
     childrenByParent: new Map(),
@@ -201,14 +203,17 @@ export class PathSearchCatalog {
       }
 
       const entryId = this.entries.length;
-      const normalizedName = entry.normalizedName ?? normalizeSearchText(entry.name);
       const normalizedPath = entry.normalizedPath ?? normalizeSearchText(entry.relativePath);
+      const normalizedName = entry.normalizedName ?? normalizeSearchText(entry.name);
       const separatorIndex = normalizedPath.lastIndexOf('/');
       const normalizedParentPath =
         separatorIndex < 0 ? '' : normalizedPath.slice(0, separatorIndex);
       let workspace = this.workspaces.get(entry.workspaceUri);
       if (!workspace) {
-        workspace = createWorkspaceCatalog(entry.workspaceUri);
+        workspace = createWorkspaceCatalog(
+          entry.workspaceUri,
+          entry.normalizedWorkspaceName ?? normalizeSearchText(entry.workspaceName),
+        );
         this.workspaces.set(entry.workspaceUri, workspace);
       }
 
@@ -277,6 +282,11 @@ export class PathSearchCatalog {
 
   getEntryById(entryId: PathEntryId): PathEntry | undefined {
     return this.entries[entryId];
+  }
+
+  normalizedWorkspaceNameForEntry(entry: PathEntry): string {
+    return this.workspaces.get(entry.workspaceUri)?.normalizedWorkspaceName ??
+      normalizeSearchText(entry.workspaceName);
   }
 
   getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined {

@@ -198,6 +198,9 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       entry,
       normalizedQuery,
       request.fuzzyMatching !== false,
+      entryId === undefined
+        ? undefined
+        : request.catalog.normalizedWorkspaceNameForEntry(entry),
     );
     if (score === undefined) {
       continue;
@@ -296,6 +299,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       entry,
       normalizedQuery,
       request.fuzzyMatching !== false,
+      request.catalog.normalizedWorkspaceNameForEntry(entry),
     );
     ranker.consider(entry, score);
     if (score !== undefined) {

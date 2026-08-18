@@ -1,5 +1,14 @@
 # Change Log
 
+## 0.8.0
+
+- Share workspace metadata through compact entry prototypes instead of repeating it on every path.
+- Omit redundant normalized-name fields retained by catalog posting keys.
+- Record normalized scan throughput per workspace and backend.
+- Make `auto` select the fastest measured compatible backend and use `fd → rg → git` before measurements exist.
+- Ramp Remote SSH and Dev Container directory-read concurrency gradually and back off on congestion.
+- Add `pathNavigator.adaptiveRemoteConcurrency` to disable dynamic remote tuning when deterministic concurrency is preferred.
+
 ## 0.7.0
 
 - Carry numeric entry IDs through candidate retrieval, reuse, and deduplication.

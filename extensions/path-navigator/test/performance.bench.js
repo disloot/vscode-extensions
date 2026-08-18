@@ -1,12 +1,16 @@
 /* Run with: node --expose-gc test/performance.bench.js [entry-count] */
 const { performance } = require('node:perf_hooks');
-const { createPathEntry } = require('../dist/pathEntry');
+const {
+  createCompactPathEntry,
+  createPathWorkspaceMetadata,
+} = require('../dist/pathEntry');
 const { PathSearchCatalog } = require('../dist/pathSearchCatalog');
 const { searchPaths } = require('../dist/pathSearchEngine');
 
 const entryCount = Number(process.argv[2] ?? 100_000);
 const workspaceUri = 'file:///benchmark';
 const workspaceName = 'benchmark';
+const workspaceMetadata = createPathWorkspaceMetadata(workspaceName, workspaceUri);
 
 function heapMiB() {
   global.gc?.();
@@ -18,14 +22,14 @@ async function main() {
   const entries = Array.from({ length: entryCount }, (_, index) => {
     const group = Math.floor(index / 1_000);
     const relativePath = `packages/group-${group}/component-${index}/main-${index}.ts`;
-    return createPathEntry({
+    return createCompactPathEntry({
       kind: 'file',
       name: `main-${index}.ts`,
       relativePath,
       workspaceName,
       workspaceUri,
       normalizedWorkspaceName: workspaceName,
-    });
+    }, workspaceMetadata);
   });
   const entryHeap = heapMiB();
   const catalog = new PathSearchCatalog();

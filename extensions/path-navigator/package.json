@@ -2,7 +2,7 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
   "license": "MIT",
@@ -234,6 +234,11 @@
           "maximum": 32,
           "description": "Maximum number of workspace directories read concurrently while indexing. Lower this for high-latency or resource-constrained remote workspaces."
         },
+        "pathNavigator.adaptiveRemoteConcurrency": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ramp remote directory-read concurrency toward the configured maximum and reduce it when sustained latency indicates congestion."
+        },
         "pathNavigator.autoRefreshIndex": {
           "type": "boolean",
           "default": true,
@@ -257,7 +262,7 @@
           ],
           "enumDescriptions": [
             "Use the portable VS Code workspace file-system API and include empty directories.",
-            "Try Git, fd, and ripgrep in order, then fall back to the workspace file-system API.",
+            "Use measured per-workspace throughput to choose workspace.fs or order fd, ripgrep, and Git, then fall back safely.",
             "Use git ls-files and derive directories. Ignored and empty directories are omitted.",
             "Use fd for files and directories, falling back to the workspace file-system API when unavailable.",
             "Use ripgrep for files and derive directories. Empty directories are omitted."

@@ -8,6 +8,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const index = new PathIndex(
     context.storageUri,
     () => recentPaths.getUsages().map(({ entry }) => entry),
+    context.workspaceState,
   );
   const picker = new PathPicker(index, recentPaths);
 

@@ -1,10 +1,21 @@
 import * as vscode from 'vscode';
 import {
+  prefersWorkspaceFs,
+  rankExternalBackends,
+  type StoredBackendPerformance,
+  updateBackendPerformance,
+} from './backendPerformance';
+import {
   scanWithExternalBackend,
   type IndexingBackend,
   type ScannedExternalPath,
 } from './externalPathScanner';
-import { createPathEntry, PathEntry } from './pathEntry';
+import {
+  createCompactPathEntry,
+  createPathWorkspaceMetadata,
+  PathEntry,
+  type PathWorkspaceMetadata,
+} from './pathEntry';
 import {
   hasExcludedFileExtension,
   normalizeExcludedFileExtensions,
@@ -16,7 +27,11 @@ import { normalizeSearchText } from './search';
 interface IndexSnapshot {
   readonly errors: readonly string[];
   readonly partial: boolean;
+  readonly backend?: Exclude<IndexingBackend, 'auto'>;
+  readonly durationMs?: number;
+  readonly pathCount?: number;
 }
+
 
 interface PendingDirectory {
   readonly uri: vscode.Uri;
@@ -30,6 +45,7 @@ interface IndexConfiguration {
   readonly excludedFileExtensions: ReadonlySet<string>;
   readonly maxEntries: number;
   readonly indexConcurrency: number;
+  readonly adaptiveRemoteConcurrency: boolean;
   readonly incrementalUpdateBatchLimit: number;
   readonly indexingBackend: IndexingBackend;
   readonly initialIndexDepth: number;
@@ -52,10 +68,12 @@ const DEFAULT_INCREMENTAL_UPDATE_BATCH_LIMIT = 2_000;
 const CATALOG_COMPACTION_TOMBSTONE_RATIO = 0.2;
 const CACHE_SAVE_DEBOUNCE_MS = 2_000;
 const CACHE_RESTORE_BATCH_SIZE = 5_000;
+const BACKEND_PERFORMANCE_STORAGE_KEY = 'pathNavigator.backendPerformance.v1';
 
 async function scanDirectoryWorkQueue(
   initialDirectories: readonly PendingDirectory[],
-  concurrency: number,
+  maxConcurrency: number,
+  adaptiveConcurrency: boolean,
   shouldContinue: () => boolean,
   isPriority: (directory: PendingDirectory) => boolean,
   scan: (directory: PendingDirectory) => Promise<readonly PendingDirectory[]>,
@@ -64,6 +82,12 @@ async function scanDirectoryWorkQueue(
   const normalQueue = [...initialDirectories];
   let normalIndex = 0;
   let activeWorkers = 0;
+  let targetConcurrency = adaptiveConcurrency
+    ? Math.min(maxConcurrency, 4)
+    : maxConcurrency;
+  let latencyEwma = 0;
+  let bestLatencyEwma = Number.POSITIVE_INFINITY;
+  let observedDirectories = 0;
 
   const takeNext = (): PendingDirectory | undefined =>
     priorityQueue.pop() ?? normalQueue[normalIndex++];
@@ -72,12 +96,13 @@ async function scanDirectoryWorkQueue(
 
   await new Promise<void>((resolve) => {
     const schedule = (): void => {
-      while (activeWorkers < concurrency && hasPending() && shouldContinue()) {
+      while (activeWorkers < targetConcurrency && hasPending() && shouldContinue()) {
         const directory = takeNext();
         if (!directory) {
           break;
         }
         activeWorkers += 1;
+        const startedAt = performance.now();
         void scan(directory)
           .then((children) => {
             for (const child of children) {
@@ -89,6 +114,22 @@ async function scanDirectoryWorkQueue(
             }
           })
           .finally(() => {
+            const durationMs = performance.now() - startedAt;
+            latencyEwma = latencyEwma === 0
+              ? durationMs
+              : latencyEwma * 0.8 + durationMs * 0.2;
+            bestLatencyEwma = Math.min(bestLatencyEwma, latencyEwma);
+            observedDirectories += 1;
+            if (adaptiveConcurrency && observedDirectories % 8 === 0) {
+              if (
+                latencyEwma > bestLatencyEwma * 2.5 &&
+                targetConcurrency > 2
+              ) {
+                targetConcurrency = Math.max(2, Math.floor(targetConcurrency * 0.75));
+              } else if (hasPending()) {
+                targetConcurrency = Math.min(maxConcurrency, targetConcurrency + 2);
+              }
+            }
             activeWorkers -= 1;
             if (activeWorkers === 0 && (!hasPending() || !shouldContinue())) {
               resolve();
@@ -117,13 +158,14 @@ export class PathIndex implements vscode.Disposable {
   private readonly persistence: PathIndexPersistence;
   private readonly expandedScopes = new Set<string>();
   private readonly scopeIndexPromises = new Map<string, Promise<void>>();
-  private readonly normalizedWorkspaceNames = new Map<string, string>();
+  private readonly workspaceMetadata = new Map<string, PathWorkspaceMetadata>();
   private cacheSaveTimer: NodeJS.Timeout | undefined;
   private generation = 0;
   private building = false;
   private limited = false;
   private partial = false;
   private ready = false;
+  private readonly backendPerformance: StoredBackendPerformance;
 
   readonly onDidChange = this.changeEmitter.event;
   readonly onDidChangeBuilding = this.statusEmitter.event;
@@ -131,8 +173,13 @@ export class PathIndex implements vscode.Disposable {
   constructor(
     storageUri?: vscode.Uri,
     private readonly priorityPathsProvider?: () => readonly PathEntry[],
+    private readonly workspaceState?: vscode.Memento,
   ) {
     this.persistence = new PathIndexPersistence(storageUri);
+    this.backendPerformance = workspaceState?.get<StoredBackendPerformance>(
+      BACKEND_PERFORMANCE_STORAGE_KEY,
+      {},
+    ) ?? {};
     this.disposables.push(this.changeEmitter, this.statusEmitter);
     this.disposables.push(
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -156,6 +203,7 @@ export class PathIndex implements vscode.Disposable {
           event.affectsConfiguration('pathNavigator.excludeFileExtensions') ||
           event.affectsConfiguration('pathNavigator.maxIndexEntries') ||
           event.affectsConfiguration('pathNavigator.indexConcurrency') ||
+          event.affectsConfiguration('pathNavigator.adaptiveRemoteConcurrency') ||
           event.affectsConfiguration('pathNavigator.incrementalUpdateBatchLimit') ||
           event.affectsConfiguration('pathNavigator.indexingBackend') ||
           event.affectsConfiguration('pathNavigator.initialIndexDepth')
@@ -400,15 +448,19 @@ export class PathIndex implements vscode.Disposable {
     concurrency: number,
     initialDepth: number,
     priorityDirectories: ReadonlySet<string>,
+    adaptiveRemoteConcurrency: boolean,
   ): Promise<IndexSnapshot> {
+    const startedAt = performance.now();
     const errors: string[] = [];
     let partial = false;
+    let pathCount = 0;
     const workspaceName = workspaceFolder.name;
     const workspaceUri = workspaceFolder.uri.toString();
-    const normalizedWorkspaceName = normalizeSearchText(workspaceName);
+    const sharedWorkspace = this.workspaceMetadataFor(workspaceFolder);
     await scanDirectoryWorkQueue(
       [{ uri: workspaceFolder.uri, relativePath: '', normalizedPath: '', depth: 0 }],
       concurrency,
+      adaptiveRemoteConcurrency && workspaceFolder.uri.scheme === 'vscode-remote',
       shouldContinue,
       (directory) => priorityDirectories.has(directory.normalizedPath),
       async (directory) => {
@@ -442,16 +494,14 @@ export class PathIndex implements vscode.Disposable {
                 continue;
               }
               const uri = vscode.Uri.joinPath(directory.uri, name);
-              discoveredEntries.push(createPathEntry({
+              discoveredEntries.push(createCompactPathEntry({
                 kind: 'directory',
                 name,
                 relativePath,
                 workspaceName,
                 workspaceUri,
-                normalizedName,
                 normalizedPath,
-                normalizedWorkspaceName,
-              }));
+              }, sharedWorkspace));
               const pathDepth = directory.depth + 1;
               if (!isSymbolicLink && (initialDepth === 0 || pathDepth < initialDepth)) {
                 childDirectories.push({
@@ -469,26 +519,31 @@ export class PathIndex implements vscode.Disposable {
             if (hasExcludedFileExtension(normalizedName, excludedFileExtensions)) {
               continue;
             }
-            discoveredEntries.push(createPathEntry({
+            discoveredEntries.push(createCompactPathEntry({
               kind: 'file',
               name,
               relativePath,
               workspaceName,
               workspaceUri,
-              normalizedName,
               normalizedPath,
-              normalizedWorkspaceName,
-            }));
+            }, sharedWorkspace));
           }
 
           if (discoveredEntries.length > 0) {
+            pathCount += discoveredEntries.length;
             onEntries(discoveredEntries);
           }
           return childDirectories;
       },
     );
 
-    return { errors, partial };
+    return {
+      errors,
+      partial,
+      backend: 'workspaceFs',
+      durationMs: performance.now() - startedAt,
+      pathCount,
+    };
   }
 
   private async scanWorkspaceFolderWithConfiguredBackend(
@@ -497,22 +552,41 @@ export class PathIndex implements vscode.Disposable {
     onEntries: (entries: readonly PathEntry[]) => void,
     shouldContinue: () => boolean,
   ): Promise<IndexSnapshot> {
-    if (configuration.indexingBackend !== 'workspaceFs' && configuration.initialIndexDepth === 0) {
+    const workspaceUri = workspaceFolder.uri.toString();
+    const autoPrefersWorkspaceFs =
+      configuration.indexingBackend === 'auto' &&
+      this.autoPrefersWorkspaceFs(workspaceUri);
+    if (
+      configuration.indexingBackend !== 'workspaceFs' &&
+      !autoPrefersWorkspaceFs &&
+      configuration.initialIndexDepth === 0
+    ) {
       const externalResult = await scanWithExternalBackend({
         backend: configuration.indexingBackend,
         workspaceFolder,
         excludedNames: configuration.excludedNames,
         excludedFileExtensions: configuration.excludedFileExtensions,
         initialDepth: configuration.initialIndexDepth,
+        preferredBackends: this.preferredExternalBackends(
+          workspaceUri,
+        ),
         shouldContinue,
         onPaths: (paths) => onEntries(this.createEntriesFromExternalPaths(workspaceFolder, paths)),
       });
       if (externalResult.handled) {
-        return { errors: [], partial: false };
+        const snapshot: IndexSnapshot = {
+          errors: [],
+          partial: false,
+          backend: externalResult.backend,
+          durationMs: externalResult.durationMs,
+          pathCount: externalResult.pathCount,
+        };
+        this.recordBackendPerformance(workspaceUri, snapshot);
+        return snapshot;
       }
     }
 
-    return this.scanWorkspaceFolder(
+    const snapshot = await this.scanWorkspaceFolder(
       workspaceFolder,
       configuration.excludedNames,
       configuration.excludedFileExtensions,
@@ -520,8 +594,42 @@ export class PathIndex implements vscode.Disposable {
       shouldContinue,
       configuration.indexConcurrency,
       configuration.initialIndexDepth,
-      this.priorityDirectoriesForWorkspace(workspaceFolder.uri.toString()),
+      this.priorityDirectoriesForWorkspace(workspaceUri),
+      configuration.adaptiveRemoteConcurrency,
     );
+    this.recordBackendPerformance(workspaceUri, snapshot);
+    return snapshot;
+  }
+
+  private autoPrefersWorkspaceFs(workspaceUri: string): boolean {
+    return prefersWorkspaceFs(workspaceUri, this.backendPerformance);
+  }
+
+  private preferredExternalBackends(
+    workspaceUri: string,
+  ): readonly Exclude<IndexingBackend, 'workspaceFs' | 'auto'>[] {
+    return rankExternalBackends(workspaceUri, this.backendPerformance);
+  }
+
+  private recordBackendPerformance(workspaceUri: string, snapshot: IndexSnapshot): void {
+    if (
+      !snapshot.backend ||
+      snapshot.durationMs === undefined ||
+      snapshot.pathCount === undefined ||
+      snapshot.pathCount === 0
+    ) {
+      return;
+    }
+    updateBackendPerformance(
+      this.backendPerformance,
+      workspaceUri,
+      snapshot.backend,
+      snapshot.durationMs,
+      snapshot.pathCount,
+    );
+    void this.workspaceState
+      ?.update(BACKEND_PERFORMANCE_STORAGE_KEY, this.backendPerformance)
+      .then(undefined, () => undefined);
   }
 
   private createEntriesFromExternalPaths(
@@ -576,8 +684,8 @@ export class PathIndex implements vscode.Disposable {
     this.setBuilding(true);
     try {
       const catalog = new PathSearchCatalog();
-      const normalizedWorkspaceNames = cached.workspaces.map((workspace) =>
-        normalizeSearchText(workspace.name),
+      const cachedWorkspaceMetadata = cached.workspaces.map((workspace) =>
+        createPathWorkspaceMetadata(workspace.name, workspace.uri),
       );
       for (let offset = 0; offset < cached.entries.length; offset += CACHE_RESTORE_BATCH_SIZE) {
         if (requestedGeneration !== this.generation) {
@@ -587,7 +695,7 @@ export class PathIndex implements vscode.Disposable {
           .slice(offset, offset + CACHE_RESTORE_BATCH_SIZE)
           .map((cachedEntry) => {
             const workspace = cached.workspaces[cachedEntry.workspaceIndex];
-            return createPathEntry({
+            return createCompactPathEntry({
               kind: cachedEntry.kind,
               name: cachedEntry.relativePath.slice(
                 cachedEntry.relativePath.lastIndexOf('/') + 1,
@@ -595,9 +703,7 @@ export class PathIndex implements vscode.Disposable {
               relativePath: cachedEntry.relativePath,
               workspaceName: workspace.name,
               workspaceUri: workspace.uri,
-              normalizedWorkspaceName:
-                normalizedWorkspaceNames[cachedEntry.workspaceIndex],
-            });
+            }, cachedWorkspaceMetadata[cachedEntry.workspaceIndex]);
           });
         catalog.addEntries(batch);
         this.searchCatalog = catalog;
@@ -795,6 +901,10 @@ export class PathIndex implements vscode.Disposable {
       indexConcurrency: Number.isFinite(configuredConcurrency)
         ? Math.min(32, Math.max(1, Math.floor(configuredConcurrency)))
         : DEFAULT_CONCURRENT_DIRECTORY_READS,
+      adaptiveRemoteConcurrency: configuration.get<boolean>(
+        'adaptiveRemoteConcurrency',
+        true,
+      ),
       incrementalUpdateBatchLimit: Number.isFinite(configuredBatchLimit)
         ? Math.max(1, Math.floor(configuredBatchLimit))
         : DEFAULT_INCREMENTAL_UPDATE_BATCH_LIMIT,
@@ -952,6 +1062,8 @@ export class PathIndex implements vscode.Disposable {
     await scanDirectoryWorkQueue(
       [initialDirectory],
       configuration.indexConcurrency,
+      configuration.adaptiveRemoteConcurrency &&
+        workspaceFolder.uri.scheme === 'vscode-remote',
       () => !this.limitReached(configuration.maxEntries),
       () => false,
       async (directory) => {
@@ -1044,19 +1156,26 @@ export class PathIndex implements vscode.Disposable {
   ): PathEntry {
     const name = relativePath.slice(relativePath.lastIndexOf('/') + 1);
     const workspaceUri = workspaceFolder.uri.toString();
-    let normalizedWorkspaceName = this.normalizedWorkspaceNames.get(workspaceUri);
-    if (!normalizedWorkspaceName) {
-      normalizedWorkspaceName = normalizeSearchText(workspaceFolder.name);
-      this.normalizedWorkspaceNames.set(workspaceUri, normalizedWorkspaceName);
-    }
-    return createPathEntry({
+    return createCompactPathEntry({
       kind,
       name,
       relativePath,
       workspaceName: workspaceFolder.name,
       workspaceUri,
-      normalizedWorkspaceName,
-    });
+    }, this.workspaceMetadataFor(workspaceFolder));
+  }
+
+  private workspaceMetadataFor(
+    workspaceFolder: vscode.WorkspaceFolder,
+  ): PathWorkspaceMetadata {
+    const workspaceUri = workspaceFolder.uri.toString();
+    const existing = this.workspaceMetadata.get(workspaceUri);
+    if (existing?.workspaceName === workspaceFolder.name) {
+      return existing;
+    }
+    const metadata = createPathWorkspaceMetadata(workspaceFolder.name, workspaceUri);
+    this.workspaceMetadata.set(workspaceUri, metadata);
+    return metadata;
   }
 
   private relativePathForUri(
