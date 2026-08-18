@@ -2,7 +2,7 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.2.1",
+  "version": "0.4.0",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
   "license": "SEE LICENSE IN LICENSE",
@@ -66,6 +66,28 @@
         "command": "pathNavigator.selectPrevious",
         "title": "Select Previous Result",
         "category": "Path Navigator"
+      },
+      {
+        "command": "pathNavigator.goToParent",
+        "title": "Go to Parent Directory",
+        "category": "Path Navigator"
+      },
+      {
+        "command": "pathNavigator.refreshPicker",
+        "title": "Refresh Active Picker",
+        "category": "Path Navigator"
+      },
+      {
+        "command": "pathNavigator.openSettings",
+        "title": "Open Settings",
+        "category": "Path Navigator",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "pathNavigator.configureKeyboardShortcuts",
+        "title": "Configure Keyboard Shortcuts",
+        "category": "Path Navigator",
+        "icon": "$(keyboard)"
       }
     ],
     "menus": {
@@ -80,6 +102,14 @@
         },
         {
           "command": "pathNavigator.selectPrevious",
+          "when": "false"
+        },
+        {
+          "command": "pathNavigator.goToParent",
+          "when": "false"
+        },
+        {
+          "command": "pathNavigator.refreshPicker",
           "when": "false"
         }
       ]
@@ -104,6 +134,17 @@
         "command": "pathNavigator.selectPrevious",
         "key": "up",
         "when": "pathNavigator.active"
+      },
+      {
+        "command": "pathNavigator.goToParent",
+        "key": "shift+tab",
+        "when": "pathNavigator.active"
+      },
+      {
+        "command": "pathNavigator.refreshPicker",
+        "key": "ctrl+r",
+        "mac": "cmd+r",
+        "when": "pathNavigator.active"
       }
     ],
     "configuration": {
@@ -115,6 +156,83 @@
           "minimum": 20,
           "maximum": 2000,
           "description": "Maximum number of matching files and directories shown in the picker."
+        },
+        "pathNavigator.showFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show file results in the picker."
+        },
+        "pathNavigator.showDirectories": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show directory results in the picker. Disable this for a file-only quick opener."
+        },
+        "pathNavigator.fuzzyMatching": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow non-contiguous fuzzy matches after exact, prefix, and substring matches."
+        },
+        "pathNavigator.directoryAction": {
+          "type": "string",
+          "enum": [
+            "reveal",
+            "enter"
+          ],
+          "enumDescriptions": [
+            "Pressing Enter reveals the directory in Explorer.",
+            "Pressing Enter enters the directory and continues searching inside it."
+          ],
+          "default": "reveal",
+          "description": "Action performed when Enter accepts a directory result. Tab always enters the directory."
+        },
+        "pathNavigator.resultPathDisplay": {
+          "type": "string",
+          "enum": [
+            "parent",
+            "full",
+            "hidden"
+          ],
+          "enumDescriptions": [
+            "Show only the containing directory beside each result.",
+            "Show the complete workspace-relative path.",
+            "Hide path descriptions. Multi-root workspaces still show the workspace name."
+          ],
+          "default": "parent",
+          "description": "Controls how paths are displayed beside result names."
+        },
+        "pathNavigator.freezeResultsOnNavigation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Freeze the visible result snapshot before keyboard or mouse navigation so background updates cannot move the selection."
+        },
+        "pathNavigator.keepOpenOnFocusLost": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep the Path Navigator picker open when focus moves to another part of VS Code."
+        },
+        "pathNavigator.showStatusPrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show indexing, searching, paused, and result-limit information above the candidate list."
+        },
+        "pathNavigator.maxIndexEntries": {
+          "type": "number",
+          "default": 500000,
+          "minimum": 0,
+          "maximum": 2000000,
+          "description": "Maximum number of workspace paths retained in the index. Set to 0 for no limit. The picker reports when this limit is reached."
+        },
+        "pathNavigator.indexConcurrency": {
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 32,
+          "description": "Maximum number of workspace directories read concurrently while indexing. Lower this for high-latency or resource-constrained remote workspaces."
+        },
+        "pathNavigator.autoRefreshIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically rebuild the path index after files or directories are created or deleted."
         },
         "pathNavigator.maxSearchCandidates": {
           "type": "number",
@@ -147,12 +265,28 @@
             "node_modules",
             ".next",
             ".turbo",
+            ".venv",
+            "venv",
+            ".cache",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            "__pycache__",
             "coverage",
             "dist",
             "out",
-            "build"
+            "build",
+            "target"
           ],
           "description": "Directory names that are excluded from the path index."
+        },
+        "pathNavigator.excludeFileExtensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "File extensions or suffixes excluded from the index, for example [\".log\", \"map\", \".test.ts\"]."
         },
         "pathNavigator.openFilesInPreview": {
           "type": "boolean",

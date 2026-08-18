@@ -76,6 +76,47 @@ test('three-character queries retain capped fuzzy fallback matching', async () =
   assert.equal(progress.at(-1).entries[0].relativePath, 'src/components/Button.tsx');
 });
 
+test('fuzzy matching can be disabled without disabling substring matching', async () => {
+  const entries = [
+    entry('src/components/Button.tsx'),
+    entry('src/components/SuperButton.tsx'),
+  ];
+  const fuzzyProgress = await search(entries, {
+    query: 'sctbtn',
+    fuzzyMatching: true,
+  });
+  const strictProgress = await search(entries, {
+    query: 'sctbtn',
+    fuzzyMatching: false,
+  });
+  const substringProgress = await search(entries, {
+    query: 'button',
+    fuzzyMatching: false,
+  });
+
+  assert.equal(fuzzyProgress.at(-1).entries.length > 0, true);
+  assert.deepEqual(strictProgress.at(-1).entries, []);
+  assert.equal(substringProgress.at(-1).entries.length, 2);
+});
+
+test('file and directory results can be filtered independently', async () => {
+  const entries = [
+    entry('src', 'directory'),
+    entry('src.ts', 'file'),
+  ];
+  const filesOnly = await search(entries, {
+    query: 'src',
+    includeDirectories: false,
+  });
+  const directoriesOnly = await search(entries, {
+    query: 'src',
+    includeFiles: false,
+  });
+
+  assert.deepEqual(filesOnly.at(-1).entries.map(({ kind }) => kind), ['file']);
+  assert.deepEqual(directoriesOnly.at(-1).entries.map(({ kind }) => kind), ['directory']);
+});
+
 test('recent and frequently opened paths receive a bounded ranking boost', async () => {
   const recent = entry('src/file-b.ts');
   const progress = await search([entry('src/file-a.ts'), recent], {

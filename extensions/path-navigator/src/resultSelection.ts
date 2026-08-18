@@ -2,6 +2,7 @@ export interface IdentifiedPath {
   readonly kind: 'file' | 'directory';
   readonly relativePath: string;
   readonly workspaceUri: string;
+  readonly searchIdentity?: string;
 }
 
 export class ResultUpdateGate<T> {
@@ -37,7 +38,17 @@ export class ResultUpdateGate<T> {
 }
 
 export function pathIdentity(entry: IdentifiedPath): string {
-  return `${entry.workspaceUri}\0${entry.kind}\0${entry.relativePath}`;
+  return entry.searchIdentity ?? `${entry.workspaceUri}\0${entry.kind}\0${entry.relativePath}`;
+}
+
+export function samePathOrder(
+  left: readonly IdentifiedPath[],
+  right: readonly IdentifiedPath[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => pathIdentity(entry) === pathIdentity(right[index]))
+  );
 }
 
 export function pinActivePath<T extends IdentifiedPath>(

@@ -5,6 +5,7 @@ const {
   pinActivePath,
   restoredActiveIndex,
   ResultUpdateGate,
+  samePathOrder,
 } = require('../dist/resultSelection');
 
 function entry(relativePath, kind = 'file', workspaceUri = 'file:///workspace') {
@@ -79,4 +80,13 @@ test('changing the query resets the frozen result snapshot', () => {
   assert.equal(gate.isFrozen, false);
   assert.equal(gate.latestDeferredEntries, undefined);
   assert.equal(gate.shouldApply([entry('new-query.ts')]), true);
+});
+
+test('detects whether a visible result update preserves the exact path order', () => {
+  const first = entry('first.ts');
+  const second = entry('second.ts');
+
+  assert.equal(samePathOrder([first, second], [first, second]), true);
+  assert.equal(samePathOrder([first, second], [second, first]), false);
+  assert.equal(samePathOrder([first], [first, second]), false);
 });

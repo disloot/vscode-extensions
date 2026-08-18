@@ -26,10 +26,29 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('pathNavigator.selectPrevious', () =>
       picker.navigateSelection('previous'),
     ),
+    vscode.commands.registerCommand('pathNavigator.goToParent', () =>
+      picker.goToParentDirectory(),
+    ),
+    vscode.commands.registerCommand('pathNavigator.refreshPicker', () =>
+      picker.refreshIndex(),
+    ),
+    vscode.commands.registerCommand('pathNavigator.openSettings', () =>
+      vscode.commands.executeCommand(
+        'workbench.action.openSettings',
+        '@ext:Disloot.path-navigator',
+      ),
+    ),
+    vscode.commands.registerCommand('pathNavigator.configureKeyboardShortcuts', () =>
+      vscode.commands.executeCommand(
+        'workbench.action.openGlobalKeybindings',
+        'Path Navigator',
+      ),
+    ),
     vscode.commands.registerCommand('pathNavigator.refreshIndex', async () => {
       await index.rebuild();
+      const limitSuffix = index.isLimited ? ' (configured index limit reached)' : '';
       void vscode.window.showInformationMessage(
-        `Path Navigator indexed ${index.currentEntries.length} paths.`,
+        `Path Navigator indexed ${index.entryCount} paths${limitSuffix}.`,
       );
     }),
   );

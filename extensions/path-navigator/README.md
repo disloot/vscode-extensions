@@ -15,6 +15,8 @@ workspace-relative paths.
 - Keep large-workspace searches responsive by retaining only the highest-ranked results.
 - Pause candidate-list replacement as soon as you navigate results with the keyboard or mouse.
 - Search asynchronously in cancellable 8 ms slices with a configurable time and candidate budget.
+- Avoid rewriting an unchanged result list while the workspace index grows in the background.
+- Cache recent completed queries so returning to one is immediate while the index is unchanged.
 - Prioritize recently and frequently opened workspace files using workspace-local history.
 - Support multi-root, remote, and virtual workspaces through `workspace.fs`.
 
@@ -28,7 +30,8 @@ workspace-relative paths.
 4. Press Tab to complete the active result. Completing `abc` changes the input to
    `abc/` and shows only its immediate files and subdirectories.
 5. Continue typing and pressing Tab to navigate the path one level at a time.
-6. Press Enter on a file to open it, or on a directory to reveal it in Explorer.
+6. Press Enter on a file to open it. By default, Enter on a directory reveals it
+   in Explorer; set `pathNavigator.directoryAction` to `enter` to navigate into it.
 
 Global search and directory navigation work together. Given
 `abc/bcd/cde/file.ts`, typing `fi` or `ile` at the workspace root finds the file
@@ -47,6 +50,11 @@ but their incremental results are deferred and never replace that snapshot. Mous
 selection provides the same freeze as a fallback. Editing the query, entering a
 directory, pressing refresh, or reopening the picker starts a fresh result stream.
 
+The status line distinguishes indexing, searching, paused results, search-budget
+limits, and index-size limits. While results are still allowed to update, the picker
+also preserves its scroll position and skips updates whose visible ordering has not
+changed.
+
 For example, the path `abc/bcd/cde` can be reached as follows:
 
 ```text
@@ -58,9 +66,49 @@ cd  → Tab → abc/bcd/cde
 The refresh button in the picker rebuilds the path index. You can also run
 **Path Navigator: Refresh Path Index**.
 
+The gear button opens the extension settings. Run **Path Navigator: Configure
+Keyboard Shortcuts** to open VS Code's native Keyboard Shortcuts editor filtered
+to Path Navigator commands.
+
+## Keyboard shortcuts
+
+All shortcuts are regular VS Code keybindings and can be changed or removed in
+the Keyboard Shortcuts editor.
+
+| Action | macOS | Windows/Linux |
+| --- | --- | --- |
+| Open Path Navigator | `Cmd+Alt+P` | `Ctrl+Alt+P` |
+| Next / previous result | `Down` / `Up` | `Down` / `Up` |
+| Enter selected directory | `Tab` | `Tab` |
+| Go to parent directory | `Shift+Tab` | `Shift+Tab` |
+| Refresh active picker | `Cmd+R` | `Ctrl+R` |
+
+## Search and interaction settings
+
+- `pathNavigator.showFiles`: include files in results (default `true`).
+- `pathNavigator.showDirectories`: include directories in results (default `true`).
+- `pathNavigator.fuzzyMatching`: allow non-contiguous fuzzy matches (default `true`).
+- `pathNavigator.directoryAction`: make Enter `reveal` a directory or `enter` it
+  (default `reveal`; Tab always enters).
+- `pathNavigator.resultPathDisplay`: show the `parent`, `full`, or `hidden` path
+  beside each result (default `parent`).
+- `pathNavigator.freezeResultsOnNavigation`: freeze the visible result snapshot
+  while navigating (default `true`).
+- `pathNavigator.keepOpenOnFocusLost`: keep the picker open after focus changes
+  (default `false`).
+- `pathNavigator.showStatusPrompt`: show search/index status above results
+  (default `true`).
+- `pathNavigator.openFilesInPreview`: open files as preview tabs (default `false`).
+
 ## Performance settings
 
 - `pathNavigator.maxResults`: maximum visible results (default `200`).
+- `pathNavigator.maxIndexEntries`: maximum retained index size (default `500000`,
+  or `0` for unlimited). The picker reports when the limit is reached.
+- `pathNavigator.indexConcurrency`: concurrent directory reads during indexing
+  (default `12`; lower values may suit constrained remote workspaces).
+- `pathNavigator.autoRefreshIndex`: rebuild after file/directory creation or deletion
+  (default `true`).
 - `pathNavigator.maxSearchCandidates`: maximum expanded fuzzy candidates
   scored per query (default `10000`).
 - `pathNavigator.searchTimeBudgetMs`: soft fuzzy-search budget in milliseconds
@@ -71,6 +119,12 @@ The refresh button in the picker rebuilds the path index. You can also run
 The history stores path metadata, timestamps, and open counts only—never file
 contents. It also observes workspace files opened through the normal editor, not
 only files opened through Path Navigator.
+
+Common generated directories such as `.venv`, `venv`, `__pycache__`, `.cache`,
+`.pytest_cache`, and `target` are excluded by default. Customize
+`pathNavigator.excludeDirectoryNames` when a workspace has other large dependency
+or generated trees. Use `pathNavigator.excludeFileExtensions` for suffixes such as
+`.log`, `.map`, or `.test.ts`.
 
 ## Remote workspaces
 

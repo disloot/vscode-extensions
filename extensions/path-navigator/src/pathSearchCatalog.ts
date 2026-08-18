@@ -15,6 +15,7 @@ function uniqueNgrams(value: string, size: number): Set<string> {
 }
 
 export class PathSearchCatalog {
+  private static nextInstanceId = 1;
   private readonly byIdentity = new Map<string, PathEntry>();
   private readonly workspaceUris = new Set<string>();
   private readonly entriesByWorkspace = new Map<string, PathEntry[]>();
@@ -22,20 +23,28 @@ export class PathSearchCatalog {
   private readonly entriesByExactName = new Map<string, PathEntry[]>();
   private readonly entriesByNamePrefix = new Map<string, PathEntry[]>();
   private readonly entriesByBigram = new Map<string, PathEntry[]>();
+  readonly instanceId = PathSearchCatalog.nextInstanceId++;
+  private catalogRevision = 0;
 
   get size(): number {
     return this.byIdentity.size;
   }
 
+  get revision(): number {
+    return this.catalogRevision;
+  }
+
   addEntries(entries: readonly PathEntry[]): void {
+    let addedEntries = false;
     for (const entry of entries) {
       const identity = pathIdentity(entry);
       if (this.byIdentity.has(identity)) {
         continue;
       }
 
-      const normalizedName = normalizeSearchText(entry.name);
-      const normalizedPath = normalizeSearchText(entry.relativePath);
+      addedEntries = true;
+      const normalizedName = entry.normalizedName ?? normalizeSearchText(entry.name);
+      const normalizedPath = entry.normalizedPath ?? normalizeSearchText(entry.relativePath);
       const separatorIndex = normalizedPath.lastIndexOf('/');
       const normalizedParentPath =
         separatorIndex < 0 ? '' : normalizedPath.slice(0, separatorIndex);
@@ -71,6 +80,9 @@ export class PathSearchCatalog {
         );
       }
     }
+    if (addedEntries) {
+      this.catalogRevision += 1;
+    }
   }
 
   getEntry(identity: string): PathEntry | undefined {
@@ -78,11 +90,19 @@ export class PathSearchCatalog {
   }
 
   isWithinScope(entry: PathEntry, scopePath: string, directChildrenOnly = false): boolean {
-    const normalizedPath = normalizeSearchText(entry.relativePath);
+    const normalizedScope = normalizeSearchText(scopePath).replace(/\/$/, '');
+    return this.isWithinNormalizedScope(entry, normalizedScope, directChildrenOnly);
+  }
+
+  isWithinNormalizedScope(
+    entry: PathEntry,
+    normalizedScope: string,
+    directChildrenOnly = false,
+  ): boolean {
+    const normalizedPath = entry.normalizedPath ?? normalizeSearchText(entry.relativePath);
     const separatorIndex = normalizedPath.lastIndexOf('/');
     const normalizedParentPath =
       separatorIndex < 0 ? '' : normalizedPath.slice(0, separatorIndex);
-    const normalizedScope = normalizeSearchText(scopePath).replace(/\/$/, '');
 
     if (directChildrenOnly) {
       return normalizedParentPath === normalizedScope;

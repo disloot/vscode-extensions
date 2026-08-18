@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { PathEntry } from './pathEntry';
+import { createPathEntry, type PathEntry } from './pathEntry';
 import type { PathUsage } from './pathSearchEngine';
 import { pathIdentity } from './resultSelection';
 
@@ -36,8 +36,12 @@ function isStoredRecentPath(value: unknown): value is StoredRecentPath {
 }
 
 export class RecentPathStore implements vscode.Disposable {
+  private readonly disposables: vscode.Disposable[] = [];
   private readonly paths = new Map<string, StoredRecentPath>();
+  private cachedLimit = -1;
+  private cachedUsages: readonly PathUsage[] | undefined;
   private persistTimer: NodeJS.Timeout | undefined;
+  private usageRevision = 0;
 
   constructor(private readonly workspaceState: vscode.Memento) {
     const storedPaths = workspaceState.get<unknown[]>(STORAGE_KEY, []);
@@ -54,28 +58,44 @@ export class RecentPathStore implements vscode.Disposable {
         storedPath,
       );
     }
+    this.disposables.push(
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration('pathNavigator.recentPathsLimit')) {
+          this.invalidateUsageCache();
+        }
+      }),
+    );
   }
 
-  getUsages(): PathUsage[] {
+  get revision(): number {
+    return this.usageRevision;
+  }
+
+  getUsages(): readonly PathUsage[] {
     const limit = this.configuredLimit();
     if (limit === 0) {
       return [];
     }
-    return [...this.paths.values()]
+    if (this.cachedUsages && this.cachedLimit === limit) {
+      return this.cachedUsages;
+    }
+    this.cachedLimit = limit;
+    this.cachedUsages = [...this.paths.values()]
       .sort((left, right) => right.lastOpenedAt - left.lastOpenedAt)
       .slice(0, limit)
       .map((storedPath) => ({
-        entry: {
+        entry: createPathEntry({
           uri: vscode.Uri.parse(storedPath.uri),
           kind: storedPath.kind,
           name: storedPath.name,
           relativePath: storedPath.relativePath,
           workspaceName: storedPath.workspaceName,
           workspaceUri: storedPath.workspaceUri,
-        },
+        }),
         lastOpenedAt: storedPath.lastOpenedAt,
         openCount: storedPath.openCount,
       }));
+    return this.cachedUsages;
   }
 
   record(entry: PathEntry): void {
@@ -98,6 +118,7 @@ export class RecentPathStore implements vscode.Disposable {
       lastOpenedAt: openedAt,
       openCount: (previous?.openCount ?? 0) + (isDuplicateOpenEvent ? 0 : 1),
     });
+    this.invalidateUsageCache();
     this.prune();
     this.schedulePersist();
   }
@@ -115,20 +136,23 @@ export class RecentPathStore implements vscode.Disposable {
     if (!name || !relativePath) {
       return;
     }
-    this.record({
+    this.record(createPathEntry({
       uri,
       kind: 'file',
       name,
       relativePath,
       workspaceName: workspaceFolder.name,
       workspaceUri: workspaceFolder.uri.toString(),
-    });
+    }));
   }
 
   dispose(): void {
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = undefined;
+    }
+    for (const disposable of this.disposables) {
+      disposable.dispose();
     }
     void this.persist().catch(() => undefined);
   }
@@ -152,6 +176,12 @@ export class RecentPathStore implements vscode.Disposable {
     for (const [identity, storedPath] of retained) {
       this.paths.set(identity, storedPath);
     }
+  }
+
+  private invalidateUsageCache(): void {
+    this.cachedUsages = undefined;
+    this.cachedLimit = -1;
+    this.usageRevision += 1;
   }
 
   private schedulePersist(): void {

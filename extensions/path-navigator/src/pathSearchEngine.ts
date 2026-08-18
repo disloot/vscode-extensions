@@ -5,6 +5,7 @@ import {
   isDescendantOfScope,
   isDirectChild,
   normalizeSearchQuery,
+  normalizeSearchText,
   scorePathWithNormalizedQuery,
   TopKPathRanker,
 } from './search';
@@ -32,6 +33,9 @@ export interface PathSearchRequest {
   readonly timeBudgetMs: number;
   readonly recentPaths: readonly PathUsage[];
   readonly allowUnindexedRecentPaths: boolean;
+  readonly includeFiles?: boolean;
+  readonly includeDirectories?: boolean;
+  readonly fuzzyMatching?: boolean;
   readonly isCancelled: () => boolean;
   readonly onProgress: (progress: PathSearchProgress) => void;
   readonly now?: number;
@@ -115,12 +119,19 @@ function recentPathBelongsToRequest(
     : isDescendantOfScope(entry.relativePath, scopePath);
 }
 
+function entryKindIsIncluded(entry: PathEntry, request: PathSearchRequest): boolean {
+  return entry.kind === 'file'
+    ? request.includeFiles !== false
+    : request.includeDirectories !== false;
+}
+
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
 export async function searchPaths(request: PathSearchRequest): Promise<void> {
   const normalizedQuery = normalizeSearchQuery(request.query);
+  const normalizedScope = normalizeSearchText(request.scopePath).replace(/\/$/, '');
   const ranker = new TopKPathRanker<PathEntry>(request.maxResults);
   const seenIdentities = new Set<string>();
   const now = request.now ?? Date.now();
@@ -136,6 +147,9 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     if (!entry) {
       continue;
     }
+    if (!entryKindIsIncluded(entry, request)) {
+      continue;
+    }
     if (
       !recentPathBelongsToRequest(
         entry,
@@ -146,7 +160,11 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     ) {
       continue;
     }
-    const score = scorePathWithNormalizedQuery(entry, normalizedQuery);
+    const score = scorePathWithNormalizedQuery(
+      entry,
+      normalizedQuery,
+      request.fuzzyMatching !== false,
+    );
     if (score === undefined) {
       continue;
     }
@@ -209,6 +227,10 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       }
     }
 
+    if (!entryKindIsIncluded(entry, request)) {
+      continue;
+    }
+
     const identity = pathIdentity(entry);
     if (seenIdentities.has(identity)) {
       continue;
@@ -217,7 +239,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
 
     const directChildrenOnly = normalizedQuery.length === 0;
     if (
-      !request.catalog.isWithinScope(entry, request.scopePath, directChildrenOnly)
+      !request.catalog.isWithinNormalizedScope(entry, normalizedScope, directChildrenOnly)
     ) {
       continue;
     }
@@ -227,7 +249,10 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       break;
     }
     processedCandidates += 1;
-    ranker.consider(entry, scorePathWithNormalizedQuery(entry, normalizedQuery));
+    ranker.consider(
+      entry,
+      scorePathWithNormalizedQuery(entry, normalizedQuery, request.fuzzyMatching !== false),
+    );
   }
 
   if (!request.isCancelled()) {

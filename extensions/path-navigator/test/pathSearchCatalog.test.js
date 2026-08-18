@@ -68,3 +68,18 @@ test('catalog checks descendant and direct-child scopes', () => {
   assert.equal(catalog.isWithinScope(nested, 'src'), true);
   assert.equal(catalog.isWithinScope(nested, 'test'), false);
 });
+
+test('catalog revision changes only when new entries are accepted', () => {
+  const catalog = new PathSearchCatalog();
+  const otherCatalog = new PathSearchCatalog();
+  const file = entry('src/index.ts');
+
+  assert.notEqual(catalog.instanceId, otherCatalog.instanceId);
+  assert.equal(catalog.revision, 0);
+  catalog.addEntries([file]);
+  assert.equal(catalog.revision, 1);
+  catalog.addEntries([file]);
+  assert.equal(catalog.revision, 1);
+  catalog.addEntries([entry('src/other.ts')]);
+  assert.equal(catalog.revision, 2);
+});

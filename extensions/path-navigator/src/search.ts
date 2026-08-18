@@ -3,6 +3,9 @@ export interface SearchablePath {
   readonly name: string;
   readonly relativePath: string;
   readonly workspaceName: string;
+  readonly normalizedName?: string;
+  readonly normalizedPath?: string;
+  readonly normalizedWorkspaceName?: string;
 }
 
 export interface RankedPath<T extends SearchablePath> {
@@ -43,6 +46,15 @@ export function parsePathInput(value: string): ParsedPathInput {
     scopePath: normalized.slice(0, separatorIndex),
     query: normalized.slice(separatorIndex + 1),
   };
+}
+
+export function parentDirectoryInput(value: string): string {
+  const { scopePath } = parsePathInput(value);
+  if (!scopePath) {
+    return '';
+  }
+  const separatorIndex = scopePath.lastIndexOf('/');
+  return separatorIndex < 0 ? '' : `${scopePath.slice(0, separatorIndex)}/`;
 }
 
 export function isDirectChild(relativePath: string, scopePath: string): boolean {
@@ -88,17 +100,16 @@ export function scorePath(item: SearchablePath, rawQuery: string): number | unde
 export function scorePathWithNormalizedQuery(
   item: SearchablePath,
   query: string,
+  fuzzyMatching = true,
 ): number | undefined {
   if (!query) {
     return item.kind === 'directory' ? 10 : 0;
   }
 
-  const path = normalizeSearchText(item.relativePath);
-  const name = normalizeSearchText(item.name);
-  const workspace = normalizeSearchText(item.workspaceName);
-  const searchablePath = `${workspace}/${path}`;
+  const path = item.normalizedPath ?? normalizeSearchText(item.relativePath);
+  const name = item.normalizedName ?? normalizeSearchText(item.name);
 
-  if (path === query || searchablePath === query) {
+  if (path === query) {
     return 10_000;
   }
   if (path.startsWith(query)) {
@@ -121,12 +132,17 @@ export function scorePathWithNormalizedQuery(
     return 7_000 - pathIndex - path.length * 0.1;
   }
 
+  const workspace = item.normalizedWorkspaceName ?? normalizeSearchText(item.workspaceName);
+  const searchablePath = `${workspace}/${path}`;
+  if (searchablePath === query) {
+    return 10_000;
+  }
   const workspacePathIndex = searchablePath.indexOf(query);
   if (workspacePathIndex >= 0) {
     return 6_500 - workspacePathIndex - searchablePath.length * 0.1;
   }
 
-  return subsequenceScore(searchablePath, query);
+  return fuzzyMatching ? subsequenceScore(searchablePath, query) : undefined;
 }
 
 function compareRankedPaths<T extends SearchablePath>(

@@ -3,6 +3,7 @@ const test = require('node:test');
 const {
   isDescendantOfScope,
   isDirectChild,
+  parentDirectoryInput,
   parsePathInput,
   rankPaths,
   scorePath,
@@ -26,6 +27,18 @@ test('exact paths rank above partial paths', () => {
 
 test('normalizes Windows path separators', () => {
   assert.equal(scorePath(entry('src/components/Button.tsx'), 'src\\components\\button.tsx'), 10_000);
+});
+
+test('uses pre-normalized path metadata without changing ranking semantics', () => {
+  const item = {
+    ...entry('SRC/Components/Button.tsx', 'file', 'Demo'),
+    normalizedName: 'button.tsx',
+    normalizedPath: 'src/components/button.tsx',
+    normalizedWorkspaceName: 'demo',
+  };
+
+  assert.equal(scorePath(item, 'src/components/button.tsx'), 10_000);
+  assert.notEqual(scorePath(item, 'demo/src/components/button.tsx'), undefined);
 });
 
 test('supports fuzzy subsequence matching', () => {
@@ -94,6 +107,13 @@ test('parses the current directory and query from path input', () => {
     scopePath: 'abc',
     query: '',
   });
+});
+
+test('moves a scoped query to its parent directory', () => {
+  assert.equal(parentDirectoryInput('abc/bcd/query'), 'abc/');
+  assert.equal(parentDirectoryInput('abc/bcd/'), 'abc/');
+  assert.equal(parentDirectoryInput('abc/query'), '');
+  assert.equal(parentDirectoryInput('query'), '');
 });
 
 test('recognizes only immediate children of the current directory', () => {
