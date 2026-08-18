@@ -234,3 +234,32 @@ test('a non-exhaustive reused candidate pool still falls back to the live catalo
 
   assert.equal(progress.at(-1).entries[0].relativePath, target.relativePath);
 });
+
+test('global path mode retrieves by the final segment and ranks by the complete path', async () => {
+  const target = entry('src/components/Button.tsx');
+  const progress = await search([
+    target,
+    entry('test/components/Button.tsx'),
+    entry('src/components/Input.tsx'),
+  ], {
+    query: 'src/components/button',
+    globalPathQuery: true,
+  });
+
+  assert.equal(progress.at(-1).entries[0].relativePath, target.relativePath);
+});
+
+test('pinned paths receive a stable ranking boost', async () => {
+  const pinned = entry('deep/file-b.ts');
+  const progress = await search([entry('file-a.ts'), pinned], {
+    query: 'file',
+    recentPaths: [{
+      entry: pinned,
+      lastOpenedAt: 0,
+      openCount: 0,
+      pinned: true,
+    }],
+  });
+
+  assert.equal(progress.at(-1).entries[0].relativePath, pinned.relativePath);
+});

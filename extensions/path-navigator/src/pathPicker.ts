@@ -69,9 +69,25 @@ export class PathPicker {
       iconPath: new vscode.ThemeIcon('gear'),
       tooltip: 'Open Path Navigator settings',
     };
+    let showFiles = vscode.workspace
+      .getConfiguration('pathNavigator')
+      .get<boolean>('showFiles', true);
+    let showDirectories = vscode.workspace
+      .getConfiguration('pathNavigator')
+      .get<boolean>('showDirectories', true);
+    let fileFilterButton: vscode.QuickInputButton;
+    let directoryFilterButton: vscode.QuickInputButton;
     const enterDirectoryButton: vscode.QuickInputButton = {
       iconPath: new vscode.ThemeIcon('arrow-right'),
       tooltip: 'Enter directory',
+    };
+    const pinButton: vscode.QuickInputButton = {
+      iconPath: new vscode.ThemeIcon('star-empty'),
+      tooltip: 'Pin this path',
+    };
+    const unpinButton: vscode.QuickInputButton = {
+      iconPath: new vscode.ThemeIcon('star-full'),
+      tooltip: 'Unpin this path',
     };
     const disposables: vscode.Disposable[] = [];
     let scheduledIndexUpdate: NodeJS.Timeout | undefined;
@@ -85,9 +101,25 @@ export class PathPicker {
     let currentScopePath = '';
     let currentSearchTruncated = false;
     let reusableSearch: ReusableSearchState | undefined;
-    picker.placeholder = 'Search paths · ↑↓ navigate · Tab enter directory';
+    picker.placeholder = 'Search paths · // global path · Tab enter directory';
     picker.title = 'Path Navigator';
-    picker.buttons = [refreshButton, settingsButton];
+    const updateFilterButtons = (): void => {
+      fileFilterButton = {
+        iconPath: new vscode.ThemeIcon(showFiles ? 'files' : 'circle-slash'),
+        tooltip: showFiles ? 'Hide files' : 'Show files',
+      };
+      directoryFilterButton = {
+        iconPath: new vscode.ThemeIcon(showDirectories ? 'folder' : 'circle-slash'),
+        tooltip: showDirectories ? 'Hide directories' : 'Show directories',
+      };
+      picker.buttons = [
+        fileFilterButton,
+        directoryFilterButton,
+        refreshButton,
+        settingsButton,
+      ];
+    };
+    updateFilterButtons();
     picker.busy = this.index.isBuilding;
     picker.ignoreFocusOut = vscode.workspace
       .getConfiguration('pathNavigator')
@@ -236,7 +268,13 @@ export class PathPicker {
         return;
       }
       const nextItems = nextVisibleEntries.map((item) =>
-        this.toQuickPickItem(item, enterDirectoryButton, resultPathDisplay),
+        this.toQuickPickItem(
+          item,
+          enterDirectoryButton,
+          pinButton,
+          unpinButton,
+          resultPathDisplay,
+        ),
       );
       currentVisibleEntries = nextVisibleEntries;
       suppressActiveChange = true;
@@ -270,7 +308,7 @@ export class PathPicker {
         resultUpdates.reset();
       }
       this.reconcileWorkspaceLock(picker.value);
-      const { scopePath, query } = parsePathInput(picker.value);
+      const { scopePath, query, mode } = parsePathInput(picker.value);
       void this.index.ensureScopeIndexed(this.workspaceLock?.workspaceUri, scopePath);
       currentScopePath = scopePath;
       currentSearchTruncated = false;
@@ -281,9 +319,13 @@ export class PathPicker {
       const maxResults = configuration.get<number>('maxResults', 200);
       const maxCandidates = configuration.get<number>('maxSearchCandidates', 10_000);
       const timeBudgetMs = configuration.get<number>('searchTimeBudgetMs', 150);
-      const includeFiles = configuration.get<boolean>('showFiles', true);
-      const includeDirectories = configuration.get<boolean>('showDirectories', true);
+      const includeFiles = showFiles;
+      const includeDirectories = showDirectories;
       const fuzzyMatching = configuration.get<boolean>('fuzzyMatching', true);
+      const progressiveSearchResults = configuration.get<boolean>(
+        'progressiveSearchResults',
+        false,
+      );
       const catalog = this.index.currentSearchCatalog;
       const catalogRevision = catalog.revision;
       const workspaceUri = this.workspaceLock?.workspaceUri;
@@ -298,6 +340,8 @@ export class PathPicker {
         includeFiles,
         includeDirectories,
         fuzzyMatching,
+        mode,
+        progressiveSearchResults,
       ]);
       const previousReusableSearch = reusableSearch;
       const canReusePrevious =
@@ -323,6 +367,8 @@ export class PathPicker {
         includeFiles,
         includeDirectories,
         fuzzyMatching,
+        mode,
+        progressiveSearchResults,
         this.recentPaths.revision,
       ]);
       const cachedResult = !this.index.isBuilding ? this.searchCache.get(cacheKey) : undefined;
@@ -354,6 +400,8 @@ export class PathPicker {
         includeFiles,
         includeDirectories,
         fuzzyMatching,
+        globalPathQuery: mode === 'globalPath',
+        publishIntermediateResults: progressiveSearchResults,
         reuse,
         isCancelled: () =>
           generation !== searchGeneration || this.activePicker !== picker,
@@ -462,7 +510,23 @@ export class PathPicker {
         void this.openEntry(selected.entry);
       }),
       picker.onDidTriggerButton((button) => {
-        if (button === refreshButton) {
+        if (button === fileFilterButton) {
+          if (showFiles && !showDirectories) {
+            return;
+          }
+          showFiles = !showFiles;
+          updateFilterButtons();
+          this.searchCache.clear();
+          startSearch(true);
+        } else if (button === directoryFilterButton) {
+          if (showDirectories && !showFiles) {
+            return;
+          }
+          showDirectories = !showDirectories;
+          updateFilterButtons();
+          this.searchCache.clear();
+          startSearch(true);
+        } else if (button === refreshButton) {
           refreshPicker();
         } else if (button === settingsButton) {
           void vscode.commands.executeCommand('pathNavigator.openSettings');
@@ -471,6 +535,11 @@ export class PathPicker {
       picker.onDidTriggerItemButton((event) => {
         if (event.button === enterDirectoryButton) {
           this.completeEntry(event.item.entry, picker);
+        } else if (event.button === pinButton || event.button === unpinButton) {
+          this.recentPaths.togglePinned(event.item.entry);
+          resultUpdates.reset();
+          this.searchCache.clear();
+          startSearch(false);
         }
       }),
       picker.onDidHide(() => {
@@ -515,8 +584,16 @@ export class PathPicker {
           'pathNavigator.maxSearchCandidates',
           'pathNavigator.searchTimeBudgetMs',
           'pathNavigator.recentPathsLimit',
+          'pathNavigator.progressiveSearchResults',
         ];
         if (searchKeys.some((key) => event.affectsConfiguration(key))) {
+          if (event.affectsConfiguration('pathNavigator.showFiles')) {
+            showFiles = configuration.get<boolean>('showFiles', true);
+          }
+          if (event.affectsConfiguration('pathNavigator.showDirectories')) {
+            showDirectories = configuration.get<boolean>('showDirectories', true);
+          }
+          updateFilterButtons();
           this.searchCache.clear();
           startSearch(true);
         } else if (
@@ -611,6 +688,8 @@ export class PathPicker {
   private toQuickPickItem(
     entry: PathEntry,
     enterDirectoryButton: vscode.QuickInputButton,
+    pinButton: vscode.QuickInputButton,
+    unpinButton: vscode.QuickInputButton,
     pathDisplay: ResultPathDisplay,
   ): PathQuickPickItem {
     const multipleRoots = (vscode.workspace.workspaceFolders?.length ?? 0) > 1;
@@ -628,11 +707,14 @@ export class PathPicker {
       : multipleRoots
         ? entry.workspaceName
         : undefined;
+    const pinToggleButton = this.recentPaths.isPinned(entry) ? unpinButton : pinButton;
     return {
       label: `$(${entry.kind === 'directory' ? 'folder' : 'file'}) ${entry.name}`,
       description,
       alwaysShow: true,
-      buttons: entry.kind === 'directory' ? [enterDirectoryButton] : undefined,
+      buttons: entry.kind === 'directory'
+        ? [enterDirectoryButton, pinToggleButton]
+        : [pinToggleButton],
       entry,
     };
   }

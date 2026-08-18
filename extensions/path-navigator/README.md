@@ -6,6 +6,7 @@ workspace-relative paths.
 ## Features
 
 - Search all descendant files and directories using partial or fuzzy names.
+- Prefix a query with `//` to fuzzy-search a complete path without entering a scope.
 - Press Tab to complete a directory and continue searching inside it.
 - Open files as pinned editor tabs by default.
 - Reveal and select directories in the built-in Explorer.
@@ -21,6 +22,7 @@ workspace-relative paths.
 - Reuse matching candidates while a query grows, such as `mai` → `main` → `main.py`.
 - Intersect multiple compact name n-gram posting lists before broad fuzzy fallback.
 - Prioritize recently and frequently opened workspace files using workspace-local history.
+- Pin important files and directories directly from their result-row star button.
 - Restore a compressed binary index on startup and reconcile it in the background.
 - Optionally build a shallow initial index and load a directory subtree when it is entered.
 - Optionally accelerate full scans with Git, fd, or ripgrep on the workspace host.
@@ -43,6 +45,10 @@ Global search and directory navigation work together. Given
 `abc/bcd/cde/file.ts`, typing `fi` or `ile` at the workspace root finds the file
 immediately. After completing `abc/` with Tab, the same search only returns
 matches located somewhere inside `abc/`.
+
+Prefix the input with `//` when slashes should be part of a global full-path query
+instead of an exact directory scope. For example, `//src/comp/button` can rank
+`src/components/Button.tsx` without completing `src/` and `components/` first.
 
 Large workspaces use compact numeric posting lists and staged candidate retrieval. A one-character query searches
 recent paths and file-name prefixes. A two-character query searches prefixes and
@@ -106,6 +112,8 @@ the Keyboard Shortcuts editor.
   beside each result (default `parent`).
 - `pathNavigator.freezeResultsOnNavigation`: freeze the visible result snapshot
   while navigating (default `true`).
+- `pathNavigator.progressiveSearchResults`: publish intermediate search snapshots;
+  disabled by default so each bounded search updates candidates atomically.
 - `pathNavigator.keepOpenOnFocusLost`: keep the picker open after focus changes
   (default `false`).
 - `pathNavigator.showStatusPrompt`: show search/index status above results

@@ -102,10 +102,20 @@ test('parses the current directory and query from path input', () => {
   assert.deepEqual(parsePathInput('abc/bcd/cd'), {
     scopePath: 'abc/bcd',
     query: 'cd',
+    mode: 'scoped',
   });
   assert.deepEqual(parsePathInput('abc/'), {
     scopePath: 'abc',
     query: '',
+    mode: 'scoped',
+  });
+});
+
+test('double slash selects global full-path search mode', () => {
+  assert.deepEqual(parsePathInput('//src/components/but'), {
+    scopePath: '',
+    query: 'src/components/but',
+    mode: 'globalPath',
   });
 });
 

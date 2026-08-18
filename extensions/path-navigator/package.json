@@ -2,7 +2,7 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
   "license": "MIT",
@@ -204,6 +204,11 @@
           "type": "boolean",
           "default": true,
           "description": "Freeze the visible result snapshot before keyboard or mouse navigation so background updates cannot move the selection."
+        },
+        "pathNavigator.progressiveSearchResults": {
+          "type": "boolean",
+          "default": false,
+          "description": "Publish intermediate search snapshots. Disabled by default so each query updates the candidate list atomically when its bounded search completes."
         },
         "pathNavigator.keepOpenOnFocusLost": {
           "type": "boolean",

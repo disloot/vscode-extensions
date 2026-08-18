@@ -12,6 +12,7 @@ interface StoredRecentPath {
   readonly workspaceUri: string;
   readonly lastOpenedAt: number;
   readonly openCount: number;
+  readonly pinned?: boolean;
 }
 
 const STORAGE_KEY = 'pathNavigator.recentPaths.v1';
@@ -31,7 +32,8 @@ function isStoredRecentPath(value: unknown): value is StoredRecentPath {
     typeof candidate.workspaceName === 'string' &&
     typeof candidate.workspaceUri === 'string' &&
     typeof candidate.lastOpenedAt === 'number' &&
-    typeof candidate.openCount === 'number'
+    typeof candidate.openCount === 'number' &&
+    (candidate.pinned === undefined || typeof candidate.pinned === 'boolean')
   );
 }
 
@@ -81,7 +83,10 @@ export class RecentPathStore implements vscode.Disposable {
     }
     this.cachedLimit = limit;
     this.cachedUsages = [...this.paths.values()]
-      .sort((left, right) => right.lastOpenedAt - left.lastOpenedAt)
+      .sort((left, right) =>
+        Number(right.pinned === true) - Number(left.pinned === true) ||
+        right.lastOpenedAt - left.lastOpenedAt,
+      )
       .slice(0, limit)
       .map((storedPath) => ({
         entry: createPathEntry({
@@ -94,6 +99,7 @@ export class RecentPathStore implements vscode.Disposable {
         }),
         lastOpenedAt: storedPath.lastOpenedAt,
         openCount: storedPath.openCount,
+        pinned: storedPath.pinned === true,
       }));
     return this.cachedUsages;
   }
@@ -120,6 +126,7 @@ export class RecentPathStore implements vscode.Disposable {
       workspaceUri: entry.workspaceUri,
       lastOpenedAt: openedAt,
       openCount: (previous?.openCount ?? 0) + (isDuplicateOpenEvent ? 0 : 1),
+      pinned: previous?.pinned,
     });
     this.invalidateUsageCache();
     this.prune();
@@ -149,6 +156,35 @@ export class RecentPathStore implements vscode.Disposable {
     }));
   }
 
+  isPinned(entry: PathEntry): boolean {
+    return this.paths.get(pathIdentity(entry))?.pinned === true;
+  }
+
+  togglePinned(entry: PathEntry): boolean {
+    const identity = pathIdentity(entry);
+    const previous = this.paths.get(identity);
+    const pinned = previous?.pinned !== true;
+    const uri = (
+      entry.uri ??
+      vscode.Uri.joinPath(vscode.Uri.parse(entry.workspaceUri), ...entry.relativePath.split('/'))
+    ).toString();
+    this.paths.set(identity, {
+      uri,
+      kind: entry.kind,
+      name: entry.name,
+      relativePath: entry.relativePath,
+      workspaceName: entry.workspaceName,
+      workspaceUri: entry.workspaceUri,
+      lastOpenedAt: previous?.lastOpenedAt ?? 0,
+      openCount: previous?.openCount ?? 0,
+      pinned,
+    });
+    this.invalidateUsageCache();
+    this.prune();
+    this.schedulePersist();
+    return pinned;
+  }
+
   dispose(): void {
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
@@ -173,7 +209,10 @@ export class RecentPathStore implements vscode.Disposable {
       return;
     }
     const retained = [...this.paths.entries()]
-      .sort((left, right) => right[1].lastOpenedAt - left[1].lastOpenedAt)
+      .sort((left, right) =>
+        Number(right[1].pinned === true) - Number(left[1].pinned === true) ||
+        right[1].lastOpenedAt - left[1].lastOpenedAt,
+      )
       .slice(0, limit);
     this.paths.clear();
     for (const [identity, storedPath] of retained) {

@@ -16,6 +16,7 @@ export interface RankedPath<T extends SearchablePath> {
 export interface ParsedPathInput {
   readonly scopePath: string;
   readonly query: string;
+  readonly mode: 'scoped' | 'globalPath';
 }
 
 interface HeapPath<T extends SearchablePath> extends RankedPath<T> {
@@ -36,15 +37,24 @@ export function parsePathInput(value: string): ParsedPathInput {
     .replace(/^\.\/+/, '')
     .replace(/^\/+/, '')
     .replace(/\/{2,}/g, '/');
+  const globalPathMode = value.replace(/\\/g, '/').startsWith('//');
+  if (globalPathMode) {
+    return {
+      scopePath: '',
+      query: normalized,
+      mode: 'globalPath',
+    };
+  }
   const separatorIndex = normalized.lastIndexOf('/');
 
   if (separatorIndex < 0) {
-    return { scopePath: '', query: normalized };
+    return { scopePath: '', query: normalized, mode: 'scoped' };
   }
 
   return {
     scopePath: normalized.slice(0, separatorIndex),
     query: normalized.slice(separatorIndex + 1),
+    mode: 'scoped',
   };
 }
 

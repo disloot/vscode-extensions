@@ -14,6 +14,7 @@ export interface PathUsage {
   readonly entry: PathEntry;
   readonly lastOpenedAt: number;
   readonly openCount: number;
+  readonly pinned?: boolean;
 }
 
 export interface PathSearchProgress {
@@ -42,6 +43,8 @@ export interface PathSearchRequest {
   readonly includeFiles?: boolean;
   readonly includeDirectories?: boolean;
   readonly fuzzyMatching?: boolean;
+  readonly globalPathQuery?: boolean;
+  readonly publishIntermediateResults?: boolean;
   readonly reuse?: PathSearchReuse;
   readonly isCancelled: () => boolean;
   readonly onProgress: (progress: PathSearchProgress) => void;
@@ -55,10 +58,19 @@ const TWO_CHARACTER_CANDIDATE_LIMIT = 5_000;
 const CANCELLATION_CHECK_INTERVAL = 128;
 
 function usageScoreBoost(usage: PathUsage, now: number): number {
+  const pinnedBoost = usage.pinned ? 2_000 : 0;
   const frequencyBoost = Math.min(180, Math.log2(usage.openCount + 1) * 40);
   const ageInDays = Math.max(0, now - usage.lastOpenedAt) / 86_400_000;
   const recencyBoost = Math.max(0, 120 - ageInDays * 10);
-  return Math.min(300, frequencyBoost + recencyBoost);
+  return pinnedBoost + Math.min(300, frequencyBoost + recencyBoost);
+}
+
+function candidateQueryForRequest(normalizedQuery: string, globalPathQuery: boolean): string {
+  if (!globalPathQuery) {
+    return normalizedQuery;
+  }
+  const segments = normalizedQuery.split('/').filter(Boolean);
+  return segments.at(-1) ?? normalizedQuery;
 }
 
 function* combineCandidates(
@@ -147,6 +159,10 @@ function yieldToEventLoop(): Promise<void> {
 
 export async function searchPaths(request: PathSearchRequest): Promise<void> {
   const normalizedQuery = normalizeSearchQuery(request.query);
+  const normalizedCandidateQuery = candidateQueryForRequest(
+    normalizedQuery,
+    request.globalPathQuery === true,
+  );
   const normalizedScope = normalizeSearchText(request.scopePath).replace(/\/$/, '');
   const ranker = new TopKPathRanker<PathEntry>(request.maxResults);
   const seenIdentities = new Set<string>();
@@ -211,7 +227,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
   let sliceStartedAt = startedAt;
   let lastPublishedAt = startedAt;
   const maxCandidates = effectiveCandidateLimit(
-    normalizedQuery.length,
+    normalizedCandidateQuery.length,
     request.maxCandidates,
   );
   const timeBudgetMs = Number.isFinite(request.timeBudgetMs)
@@ -219,7 +235,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     : 150;
   const sources = candidateSources(
     request.catalog,
-    normalizedQuery,
+    normalizedCandidateQuery,
     request.scopePath,
     request.workspaceUri,
     request.reuse,
@@ -236,7 +252,10 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
         truncated = true;
         break;
       }
-      if (currentTime - lastPublishedAt >= SEARCH_PROGRESS_INTERVAL_MS) {
+      if (
+        request.publishIntermediateResults === true &&
+        currentTime - lastPublishedAt >= SEARCH_PROGRESS_INTERVAL_MS
+      ) {
         publish(false);
         lastPublishedAt = currentTime;
       }

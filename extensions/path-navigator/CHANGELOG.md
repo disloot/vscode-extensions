@@ -1,5 +1,12 @@
 # Change Log
 
+## 0.6.0
+
+- Update each bounded search atomically by default, with optional progressive snapshots.
+- Add `//query/path` global full-path search without changing shell-like scoped navigation.
+- Add picker buttons for instantly showing or hiding files and directories.
+- Add per-result pinning and prioritize pinned paths in recent/frequent ranking.
+
 ## 0.5.1
 
 - Keep a restored or completed index active until its background replacement is fully built.
