@@ -20,6 +20,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('pathNavigator.completePath', () =>
       picker.completeSelectedPath(),
     ),
+    vscode.commands.registerCommand('pathNavigator.selectNext', () =>
+      picker.navigateSelection('next'),
+    ),
+    vscode.commands.registerCommand('pathNavigator.selectPrevious', () =>
+      picker.navigateSelection('previous'),
+    ),
     vscode.commands.registerCommand('pathNavigator.refreshIndex', async () => {
       await index.rebuild();
       void vscode.window.showInformationMessage(

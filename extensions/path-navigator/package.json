@@ -2,7 +2,7 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
   "license": "SEE LICENSE IN LICENSE",
@@ -56,12 +56,30 @@
         "command": "pathNavigator.completePath",
         "title": "Complete Selected Path",
         "category": "Path Navigator"
+      },
+      {
+        "command": "pathNavigator.selectNext",
+        "title": "Select Next Result",
+        "category": "Path Navigator"
+      },
+      {
+        "command": "pathNavigator.selectPrevious",
+        "title": "Select Previous Result",
+        "category": "Path Navigator"
       }
     ],
     "menus": {
       "commandPalette": [
         {
           "command": "pathNavigator.completePath",
+          "when": "false"
+        },
+        {
+          "command": "pathNavigator.selectNext",
+          "when": "false"
+        },
+        {
+          "command": "pathNavigator.selectPrevious",
           "when": "false"
         }
       ]
@@ -75,6 +93,16 @@
       {
         "command": "pathNavigator.completePath",
         "key": "tab",
+        "when": "pathNavigator.active"
+      },
+      {
+        "command": "pathNavigator.selectNext",
+        "key": "down",
+        "when": "pathNavigator.active"
+      },
+      {
+        "command": "pathNavigator.selectPrevious",
+        "key": "up",
         "when": "pathNavigator.active"
       }
     ],

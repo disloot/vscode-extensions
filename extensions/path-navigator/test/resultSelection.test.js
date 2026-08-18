@@ -4,6 +4,7 @@ const {
   pathIdentity,
   pinActivePath,
   restoredActiveIndex,
+  ResultUpdateGate,
 } = require('../dist/resultSelection');
 
 function entry(relativePath, kind = 'file', workspaceUri = 'file:///workspace') {
@@ -52,4 +53,30 @@ test('falls back to the nearest previous position when the active result disappe
 
   assert.equal(restoredActiveIndex(results, pathIdentity(entry('deleted.ts')), 5), 1);
   assert.equal(restoredActiveIndex([], pathIdentity(entry('deleted.ts')), 1), -1);
+});
+
+test('freezes the visible snapshot before navigation and defers every later update', () => {
+  const gate = new ResultUpdateGate();
+  const first = [entry('first.ts')];
+  const second = [entry('second.ts')];
+  const third = [entry('third.ts')];
+
+  assert.equal(gate.shouldApply(first), true);
+  gate.freeze();
+  assert.equal(gate.shouldApply(second), false);
+  assert.equal(gate.shouldApply(third), false);
+  assert.equal(gate.isFrozen, true);
+  assert.equal(gate.latestDeferredEntries, third);
+});
+
+test('changing the query resets the frozen result snapshot', () => {
+  const gate = new ResultUpdateGate();
+  gate.freeze();
+  assert.equal(gate.shouldApply([entry('deferred.ts')]), false);
+
+  gate.reset();
+
+  assert.equal(gate.isFrozen, false);
+  assert.equal(gate.latestDeferredEntries, undefined);
+  assert.equal(gate.shouldApply([entry('new-query.ts')]), true);
 });

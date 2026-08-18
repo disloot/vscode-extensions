@@ -4,6 +4,38 @@ export interface IdentifiedPath {
   readonly workspaceUri: string;
 }
 
+export class ResultUpdateGate<T> {
+  private frozen = false;
+  private deferredEntries: readonly T[] | undefined;
+
+  get isFrozen(): boolean {
+    return this.frozen;
+  }
+
+  get latestDeferredEntries(): readonly T[] | undefined {
+    return this.deferredEntries;
+  }
+
+  reset(): void {
+    this.frozen = false;
+    this.deferredEntries = undefined;
+  }
+
+  freeze(): void {
+    this.frozen = true;
+  }
+
+  shouldApply(entries: readonly T[]): boolean {
+    if (this.frozen) {
+      this.deferredEntries = entries;
+      return false;
+    }
+
+    this.deferredEntries = undefined;
+    return true;
+  }
+}
+
 export function pathIdentity(entry: IdentifiedPath): string {
   return `${entry.workspaceUri}\0${entry.kind}\0${entry.relativePath}`;
 }

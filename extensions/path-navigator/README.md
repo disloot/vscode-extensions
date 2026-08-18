@@ -41,10 +41,11 @@ continuous name substrings. Queries of three or more characters use the rarest
 available name n-gram followed by a bounded fuzzy fallback. Exact, prefix, recent, and
 frequently opened results are evaluated before the fallback budget is consumed.
 
-When you move the active result with the keyboard or mouse, Path Navigator pauses
-visible-list replacement so background indexing and searching cannot move your
-selection. Editing the query, entering a directory, pressing refresh, or reopening
-the picker starts a fresh result stream.
+When you press Up or Down, Path Navigator freezes the visible result snapshot
+before VS Code moves the selection. Background indexing and searching can finish,
+but their incremental results are deferred and never replace that snapshot. Mouse
+selection provides the same freeze as a fallback. Editing the query, entering a
+directory, pressing refresh, or reopening the picker starts a fresh result stream.
 
 For example, the path `abc/bcd/cde` can be reached as follows:
 

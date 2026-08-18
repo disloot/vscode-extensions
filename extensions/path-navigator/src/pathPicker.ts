@@ -3,7 +3,12 @@ import { PathEntry } from './pathEntry';
 import { PathIndex } from './pathIndex';
 import { searchPaths } from './pathSearchEngine';
 import { RecentPathStore } from './recentPaths';
-import { pathIdentity, pinActivePath, restoredActiveIndex } from './resultSelection';
+import {
+  pathIdentity,
+  pinActivePath,
+  restoredActiveIndex,
+  ResultUpdateGate,
+} from './resultSelection';
 import { parsePathInput } from './search';
 
 interface PathQuickPickItem extends vscode.QuickPickItem {
@@ -14,6 +19,7 @@ const INDEX_RESULT_UPDATE_INTERVAL_MS = 200;
 
 export class PathPicker {
   private activePicker: vscode.QuickPick<PathQuickPickItem> | undefined;
+  private freezeActiveResults: (() => void) | undefined;
   private workspaceLock: { workspaceUri: string; anchorPath: string } | undefined;
 
   constructor(
@@ -47,11 +53,10 @@ export class PathPicker {
     let scheduledIndexUpdate: NodeJS.Timeout | undefined;
     let searchGeneration = 0;
     let searchInProgress = false;
-    let selectionFrozen = false;
     let suppressActiveChange = false;
     const expectedProgrammaticActiveIdentities = new Set<string>();
+    const resultUpdates = new ResultUpdateGate<PathEntry>();
     let programmaticTargetIdentity: string | undefined;
-    let pendingEntries: readonly PathEntry[] | undefined;
     let currentScopePath = '';
     let currentSearchTruncated = false;
     picker.placeholder = 'Type a name, then press Tab to complete the selected path';
@@ -76,7 +81,7 @@ export class PathPicker {
       const baseTitle = currentScopePath
         ? `Path Navigator — ${currentScopePath}/`
         : 'Path Navigator';
-      if (selectionFrozen) {
+      if (resultUpdates.isFrozen) {
         picker.title = `${baseTitle} — results paused`;
       } else if (currentSearchTruncated) {
         picker.title = `${baseTitle} — limited search`;
@@ -84,6 +89,16 @@ export class PathPicker {
         picker.title = baseTitle;
       }
     };
+
+    const freezeVisibleResults = (): void => {
+      if (resultUpdates.isFrozen) {
+        return;
+      }
+      resultUpdates.freeze();
+      clearScheduledIndexUpdate();
+      updateTitle();
+    };
+    this.freezeActiveResults = freezeVisibleResults;
 
     const consumeProgrammaticActiveChange = (
       activeIdentity: string | undefined,
@@ -108,8 +123,7 @@ export class PathPicker {
       resetActiveItem: boolean,
       searchComplete: boolean,
     ): void => {
-      if (selectionFrozen && !resetActiveItem) {
-        pendingEntries = entries;
+      if (!resultUpdates.shouldApply(entries)) {
         return;
       }
 
@@ -142,7 +156,6 @@ export class PathPicker {
       const nextItems = visibleEntries.map((item) =>
         this.toQuickPickItem(item, enterDirectoryButton),
       );
-      pendingEntries = undefined;
       suppressActiveChange = true;
       expectedProgrammaticActiveIdentities.clear();
       if (nextItems[0]) {
@@ -171,8 +184,7 @@ export class PathPicker {
     const startSearch = (resetActiveItem: boolean): void => {
       clearScheduledIndexUpdate();
       if (resetActiveItem) {
-        selectionFrozen = false;
-        pendingEntries = undefined;
+        resultUpdates.reset();
       }
       this.reconcileWorkspaceLock(picker.value);
       const { scopePath, query } = parsePathInput(picker.value);
@@ -235,13 +247,13 @@ export class PathPicker {
 
     const flushIndexUpdate = (): void => {
       clearScheduledIndexUpdate();
-      if (this.activePicker === picker && !selectionFrozen) {
+      if (this.activePicker === picker && !resultUpdates.isFrozen) {
         startSearch(false);
       }
     };
 
     const scheduleIndexUpdate = (): void => {
-      if (scheduledIndexUpdate || selectionFrozen) {
+      if (scheduledIndexUpdate || resultUpdates.isFrozen) {
         return;
       }
       scheduledIndexUpdate = setTimeout(flushIndexUpdate, INDEX_RESULT_UPDATE_INTERVAL_MS);
@@ -264,9 +276,7 @@ export class PathPicker {
           return;
         }
         if (activeIdentity) {
-          selectionFrozen = true;
-          clearScheduledIndexUpdate();
-          updateTitle();
+          freezeVisibleResults();
         }
       }),
       picker.onDidAccept(() => {
@@ -279,8 +289,7 @@ export class PathPicker {
       }),
       picker.onDidTriggerButton((button) => {
         if (button === refreshButton) {
-          selectionFrozen = false;
-          pendingEntries = undefined;
+          resultUpdates.reset();
           updateTitle();
           void this.index.rebuild();
         }
@@ -297,6 +306,7 @@ export class PathPicker {
           disposable.dispose();
         }
         this.activePicker = undefined;
+        this.freezeActiveResults = undefined;
         this.workspaceLock = undefined;
         void vscode.commands.executeCommand('setContext', 'pathNavigator.active', false);
         picker.dispose();
@@ -314,9 +324,25 @@ export class PathPicker {
     await vscode.commands.executeCommand('setContext', 'pathNavigator.active', true);
     startSearch(true);
     await this.index.ensureReady();
-    if (this.activePicker === picker && !selectionFrozen) {
+    if (this.activePicker === picker && !resultUpdates.isFrozen) {
       flushIndexUpdate();
     }
+  }
+
+  navigateSelection(direction: 'next' | 'previous'): void {
+    if (!this.activePicker) {
+      return;
+    }
+
+    // Freeze synchronously, before VS Code changes the active item. Relying only
+    // on onDidChangeActive leaves a race in which an in-flight result update can
+    // replace the list between the key press and the active-item event.
+    this.freezeActiveResults?.();
+    const command =
+      direction === 'next'
+        ? 'workbench.action.quickOpenSelectNext'
+        : 'workbench.action.quickOpenSelectPrevious';
+    void vscode.commands.executeCommand(command);
   }
 
   completeSelectedPath(): void {
