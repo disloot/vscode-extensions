@@ -109,7 +109,10 @@ export class RecentPathStore implements vscode.Disposable {
       previous !== undefined &&
       openedAt - previous.lastOpenedAt < OPEN_EVENT_DEDUPLICATION_MS;
     this.paths.set(identity, {
-      uri: entry.uri.toString(),
+      uri: (
+        entry.uri ??
+        vscode.Uri.joinPath(vscode.Uri.parse(entry.workspaceUri), ...entry.relativePath.split('/'))
+      ).toString(),
       kind: entry.kind,
       name: entry.name,
       relativePath: entry.relativePath,

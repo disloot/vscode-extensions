@@ -2,10 +2,10 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/disloot/vscode-extensions.git",
@@ -232,7 +232,57 @@
         "pathNavigator.autoRefreshIndex": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically rebuild the path index after files or directories are created or deleted."
+          "description": "Automatically apply incremental index updates after files or directories are created or deleted."
+        },
+        "pathNavigator.incrementalUpdateBatchLimit": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 1,
+          "maximum": 100000,
+          "description": "Maximum number of coalesced file-system events handled incrementally. Larger event storms trigger a full rebuild."
+        },
+        "pathNavigator.indexingBackend": {
+          "type": "string",
+          "enum": [
+            "workspaceFs",
+            "auto",
+            "git",
+            "fd",
+            "rg"
+          ],
+          "enumDescriptions": [
+            "Use the portable VS Code workspace file-system API and include empty directories.",
+            "Try Git, fd, and ripgrep in order, then fall back to the workspace file-system API.",
+            "Use git ls-files and derive directories. Ignored and empty directories are omitted.",
+            "Use fd for files and directories, falling back to the workspace file-system API when unavailable.",
+            "Use ripgrep for files and derive directories. Empty directories are omitted."
+          ],
+          "default": "workspaceFs",
+          "description": "Backend used for full workspace indexing. External commands run in the local or remote workspace extension host and are disabled in untrusted workspaces."
+        },
+        "pathNavigator.initialIndexDepth": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Initial workspace.fs indexing depth. Set to 0 for a complete index. A positive value indexes shallow paths first and loads a subtree when you enter it."
+        },
+        "pathNavigator.persistIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist a compressed workspace path index so results are available quickly after reopening the workspace."
+        },
+        "pathNavigator.persistentIndexMaxAgeHours": {
+          "type": "number",
+          "default": 168,
+          "minimum": 0,
+          "maximum": 8760,
+          "description": "Maximum age of a persistent path index in hours. Set to 0 to accept any age; background refresh can still validate it."
+        },
+        "pathNavigator.refreshPersistentIndexInBackground": {
+          "type": "boolean",
+          "default": true,
+          "description": "Rebuild the index in the background after restoring persistent results to reconcile changes made while VS Code was closed."
         },
         "pathNavigator.maxSearchCandidates": {
           "type": "number",
@@ -301,6 +351,8 @@
     "watch": "tsc -watch -p ./",
     "check": "tsc -p ./ --noEmit",
     "test": "npm run compile && node --test test/*.test.js",
+    "benchmark": "npm run compile && node --expose-gc test/performance.bench.js",
+    "benchmark:backends": "npm run compile && node --expose-gc test/backend-performance.bench.js",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {

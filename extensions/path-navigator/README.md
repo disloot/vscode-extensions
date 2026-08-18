@@ -10,14 +10,20 @@ workspace-relative paths.
 - Open files as pinned editor tabs by default.
 - Reveal and select directories in the built-in Explorer.
 - Index empty directories as well as files.
-- Keep the index updated when files or directories are created or deleted.
+- Apply file and directory creates/deletes incrementally, including directory subtrees.
+- Fall back to a full rebuild only when a configurable file-event storm is too large.
 - Preserve keyboard selection while background indexing adds or reorders results.
 - Keep large-workspace searches responsive by retaining only the highest-ranked results.
 - Pause candidate-list replacement as soon as you navigate results with the keyboard or mouse.
 - Search asynchronously in cancellable 8 ms slices with a configurable time and candidate budget.
 - Avoid rewriting an unchanged result list while the workspace index grows in the background.
 - Cache recent completed queries so returning to one is immediate while the index is unchanged.
+- Reuse matching candidates while a query grows, such as `mai` → `main` → `main.py`.
+- Intersect multiple compact name n-gram posting lists before broad fuzzy fallback.
 - Prioritize recently and frequently opened workspace files using workspace-local history.
+- Restore a compressed binary index on startup and reconcile it in the background.
+- Optionally build a shallow initial index and load a directory subtree when it is entered.
+- Optionally accelerate full scans with Git, fd, or ripgrep on the workspace host.
 - Support multi-root, remote, and virtual workspaces through `workspace.fs`.
 
 ## Usage
@@ -38,11 +44,17 @@ Global search and directory navigation work together. Given
 immediately. After completing `abc/` with Tab, the same search only returns
 matches located somewhere inside `abc/`.
 
-Large workspaces use staged candidate retrieval. A one-character query searches
+Large workspaces use compact numeric posting lists and staged candidate retrieval. A one-character query searches
 recent paths and file-name prefixes. A two-character query searches prefixes and
-continuous name substrings. Queries of three or more characters use the rarest
-available name n-gram followed by a bounded fuzzy fallback. Exact, prefix, recent, and
+continuous name substrings. Queries of three or more characters first intersect several
+selective name n-grams, then use the rarest available n-gram followed by a bounded fuzzy
+fallback. Exact, prefix, recent, and
 frequently opened results are evaluated before the fallback budget is consumed.
+
+When a query extends the previous query, its matching candidates are evaluated first.
+If the previous three-or-more-character search was exhaustive, the extension is searched
+entirely inside that previous match set. This avoids rescanning unrelated paths during
+normal continuous typing.
 
 When you press Up or Down, Path Navigator freezes the visible result snapshot
 before VS Code moves the selection. Background indexing and searching can finish,
@@ -107,8 +119,20 @@ the Keyboard Shortcuts editor.
   or `0` for unlimited). The picker reports when the limit is reached.
 - `pathNavigator.indexConcurrency`: concurrent directory reads during indexing
   (default `12`; lower values may suit constrained remote workspaces).
-- `pathNavigator.autoRefreshIndex`: rebuild after file/directory creation or deletion
+- `pathNavigator.autoRefreshIndex`: apply incremental file/directory updates
   (default `true`).
+- `pathNavigator.incrementalUpdateBatchLimit`: maximum coalesced file events handled
+  incrementally before falling back to a full rebuild (default `2000`).
+- `pathNavigator.indexingBackend`: use portable `workspaceFs` (default), or opt into
+  `auto`, `git`, `fd`, or `rg` for faster command-line-backed full scans.
+- `pathNavigator.initialIndexDepth`: initial `workspace.fs` scan depth (`0` means a
+  complete index). Positive values load entered directory subtrees on demand.
+- `pathNavigator.persistIndex`: restore a compressed binary index when reopening a
+  workspace (default `true`).
+- `pathNavigator.persistentIndexMaxAgeHours`: maximum cache age (default `168`; `0`
+  accepts any age).
+- `pathNavigator.refreshPersistentIndexInBackground`: reconcile a restored cache with
+  the live workspace in the background (default `true`).
 - `pathNavigator.maxSearchCandidates`: maximum expanded fuzzy candidates
   scored per query (default `10000`).
 - `pathNavigator.searchTimeBudgetMs`: soft fuzzy-search budget in milliseconds
@@ -116,9 +140,9 @@ the Keyboard Shortcuts editor.
 - `pathNavigator.recentPathsLimit`: workspace-local recent/frequent history
   limit (default `200`, or `0` to disable).
 
-The history stores path metadata, timestamps, and open counts only—never file
-contents. It also observes workspace files opened through the normal editor, not
-only files opened through Path Navigator.
+The history and persistent index store path metadata only—never file contents. Recent
+history additionally stores timestamps and open counts. It observes workspace files
+opened through the normal editor, not only files opened through Path Navigator.
 
 Common generated directories such as `.venv`, `venv`, `__pycache__`, `.cache`,
 `.pytest_cache`, and `target` are excluded by default. Customize
@@ -131,7 +155,14 @@ or generated trees. Use `pathNavigator.excludeFileExtensions` for suffixes such 
 Path Navigator runs as a workspace extension, so Remote SSH, Dev Containers,
 WSL, and Codespaces execute its indexer alongside the workspace. Remote indexes
 are built concurrently and publish partial results while the remaining folders
-are still being scanned.
+are still being scanned. Optional Git/fd/rg commands also run in that remote extension
+host. External command backends are disabled in untrusted workspaces and automatically
+fall back to `workspace.fs`.
+
+`workspaceFs` is the compatibility default and includes empty directories. Git and
+ripgrep derive directories from file paths, so they omit empty directories; Git also
+follows Git ignore rules. Choose `fd` when it is installed and empty-directory discovery
+is important.
 
 To test a local VSIX, first connect to the remote environment, then run
 **Extensions: Install from VSIX...** in that remote window and reload it. Use
@@ -162,6 +193,8 @@ From the repository root, run:
 npm install
 npm run check --workspace extensions/path-navigator
 npm test --workspace extensions/path-navigator
+npm run benchmark --workspace extensions/path-navigator
+npm run benchmark:backends --workspace extensions/path-navigator -- --synthetic 50000
 npm test
 ```
 

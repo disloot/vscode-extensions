@@ -4,8 +4,11 @@ import { PathPicker } from './pathPicker';
 import { RecentPathStore } from './recentPaths';
 
 export function activate(context: vscode.ExtensionContext): void {
-  const index = new PathIndex();
   const recentPaths = new RecentPathStore(context.workspaceState);
+  const index = new PathIndex(
+    context.storageUri,
+    () => recentPaths.getUsages().map(({ entry }) => entry),
+  );
   const picker = new PathPicker(index, recentPaths);
 
   context.subscriptions.push(
@@ -58,7 +61,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   if (vscode.workspace.workspaceFolders?.length) {
-    void index.rebuild();
+    void index.initialize();
   }
 }
 

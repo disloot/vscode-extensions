@@ -207,3 +207,30 @@ test('cancelled searches stop after publishing cached results', async () => {
   assert.equal(progress[0].entries[0].relativePath, 'src/cached.ts');
   assert.equal(progress[0].complete, false);
 });
+
+test('an exhaustive previous query can be reused without scanning unrelated catalog entries', async () => {
+  const reusable = entry('src/main.py');
+  const unrelated = Array.from({ length: 500 }, (_, index) =>
+    entry(`src/component-${index}.ts`),
+  );
+  const progress = await search([reusable, ...unrelated], {
+    query: 'main',
+    reuse: { entries: [reusable], exhaustive: true },
+    maxCandidates: 1,
+  });
+  const final = progress.at(-1);
+
+  assert.deepEqual(final.entries.map(({ relativePath }) => relativePath), ['src/main.py']);
+  assert.equal(final.processedCandidates, 1);
+  assert.equal(final.truncated, false);
+});
+
+test('a non-exhaustive reused candidate pool still falls back to the live catalog', async () => {
+  const target = entry('src/main.py');
+  const progress = await search([target], {
+    query: 'main',
+    reuse: { entries: [entry('src/other.ts')], exhaustive: false },
+  });
+
+  assert.equal(progress.at(-1).entries[0].relativePath, target.relativePath);
+});

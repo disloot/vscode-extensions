@@ -28,6 +28,13 @@ type ResultPathDisplay = 'parent' | 'full' | 'hidden';
 const INDEX_RESULT_UPDATE_INTERVAL_MS = 300;
 const SEARCH_CACHE_SIZE = 32;
 
+interface ReusableSearchState {
+  readonly contextKey: string;
+  readonly normalizedQuery: string;
+  readonly entries: readonly PathEntry[];
+  readonly exhaustive: boolean;
+}
+
 export class PathPicker {
   private activePicker: vscode.QuickPick<PathQuickPickItem> | undefined;
   private freezeActiveResults: (() => void) | undefined;
@@ -77,6 +84,7 @@ export class PathPicker {
     let currentVisibleEntries: readonly PathEntry[] = [];
     let currentScopePath = '';
     let currentSearchTruncated = false;
+    let reusableSearch: ReusableSearchState | undefined;
     picker.placeholder = 'Search paths · ↑↓ navigate · Tab enter directory';
     picker.title = 'Path Navigator';
     picker.buttons = [refreshButton, settingsButton];
@@ -116,6 +124,8 @@ export class PathPicker {
         picker.prompt = 'Searching indexed paths…';
       } else if (this.index.isLimited) {
         picker.prompt = `${resultCount} matches · index limited at ${this.index.entryCount.toLocaleString()} paths`;
+      } else if (this.index.isPartial) {
+        picker.prompt = `${resultCount} matches · partial index, enter a directory to load it`;
       } else if (currentSearchTruncated) {
         picker.prompt = `${resultCount} best matches · search budget reached`;
       } else if (resultCount === 0) {
@@ -261,6 +271,7 @@ export class PathPicker {
       }
       this.reconcileWorkspaceLock(picker.value);
       const { scopePath, query } = parsePathInput(picker.value);
+      void this.index.ensureScopeIndexed(this.workspaceLock?.workspaceUri, scopePath);
       currentScopePath = scopePath;
       currentSearchTruncated = false;
       updateTitle();
@@ -277,11 +288,34 @@ export class PathPicker {
       const catalogRevision = catalog.revision;
       const workspaceUri = this.workspaceLock?.workspaceUri;
       const recentPaths = this.recentPaths.getUsages();
+      const normalizedScope = normalizeSearchText(scopePath).replace(/\/$/, '');
+      const normalizedQuery = normalizeSearchQuery(query);
+      const reuseContextKey = JSON.stringify([
+        catalog.instanceId,
+        catalogRevision,
+        normalizedScope,
+        workspaceUri ?? '',
+        includeFiles,
+        includeDirectories,
+        fuzzyMatching,
+      ]);
+      const previousReusableSearch = reusableSearch;
+      const canReusePrevious =
+        previousReusableSearch !== undefined &&
+        previousReusableSearch.contextKey === reuseContextKey &&
+        normalizedQuery.length > previousReusableSearch.normalizedQuery.length &&
+        normalizedQuery.startsWith(previousReusableSearch.normalizedQuery);
+      const reuse = canReusePrevious
+        ? {
+            entries: previousReusableSearch.entries,
+            exhaustive: previousReusableSearch.exhaustive,
+          }
+        : undefined;
       const cacheKey = JSON.stringify([
         catalog.instanceId,
         catalogRevision,
-        normalizeSearchText(scopePath).replace(/\/$/, ''),
-        normalizeSearchQuery(query),
+        normalizedScope,
+        normalizedQuery,
         workspaceUri ?? '',
         maxResults,
         maxCandidates,
@@ -320,6 +354,7 @@ export class PathPicker {
         includeFiles,
         includeDirectories,
         fuzzyMatching,
+        reuse,
         isCancelled: () =>
           generation !== searchGeneration || this.activePicker !== picker,
         onProgress: (progress) => {
@@ -336,12 +371,26 @@ export class PathPicker {
           currentSearchTruncated = progress.complete && progress.truncated;
           if (progress.complete) {
             searchInProgress = false;
+            reusableSearch = {
+              contextKey: reuseContextKey,
+              normalizedQuery,
+              entries: progress.reusableCandidates ?? progress.entries,
+              exhaustive:
+                normalizedQuery.length >= 3 &&
+                !progress.truncated &&
+                progress.reusableCandidates !== undefined,
+            };
             if (
               !this.index.isBuilding &&
               this.index.currentSearchCatalog === catalog &&
               catalog.revision === catalogRevision
             ) {
-              this.searchCache.set(cacheKey, progress);
+              this.searchCache.set(cacheKey, {
+                entries: progress.entries,
+                complete: true,
+                processedCandidates: progress.processedCandidates,
+                truncated: progress.truncated,
+              });
             }
           }
           updateTitle();
@@ -589,12 +638,31 @@ export class PathPicker {
   }
 
   private async openEntry(entry: PathEntry): Promise<void> {
+    const entryUri = entry.uri ?? vscode.Uri.joinPath(
+      vscode.Uri.parse(entry.workspaceUri),
+      ...entry.relativePath.split('/'),
+    );
+    try {
+      const stat = await vscode.workspace.fs.stat(entryUri);
+      const expectedType = entry.kind === 'directory'
+        ? vscode.FileType.Directory
+        : vscode.FileType.File;
+      if ((stat.type & expectedType) === 0) {
+        throw new Error(`Path is no longer a ${entry.kind}.`);
+      }
+    } catch (error) {
+      this.index.discardEntry(entry);
+      void vscode.window.showWarningMessage(
+        `Path Navigator removed a stale result: ${entry.relativePath} (${String(error)})`,
+      );
+      return;
+    }
     if (entry.kind === 'file') {
       const preview = vscode.workspace
         .getConfiguration('pathNavigator')
         .get<boolean>('openFilesInPreview', false);
       try {
-        await vscode.commands.executeCommand('vscode.open', entry.uri, { preview });
+        await vscode.commands.executeCommand('vscode.open', entryUri, { preview });
         this.recentPaths.record(entry);
       } catch (error) {
         void vscode.window.showErrorMessage(`Could not open ${entry.relativePath}: ${String(error)}`);
@@ -603,7 +671,7 @@ export class PathPicker {
     }
 
     try {
-      await vscode.commands.executeCommand('revealInExplorer', entry.uri);
+      await vscode.commands.executeCommand('revealInExplorer', entryUri);
       this.recentPaths.record(entry);
     } catch (error) {
       void vscode.window.showErrorMessage(

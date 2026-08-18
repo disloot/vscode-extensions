@@ -4,7 +4,7 @@ import { normalizeSearchText } from './search';
 export type PathEntryKind = 'file' | 'directory';
 
 export interface PathEntry {
-  readonly uri: vscode.Uri;
+  readonly uri?: vscode.Uri;
   readonly kind: PathEntryKind;
   readonly name: string;
   readonly relativePath: string;
@@ -13,11 +13,11 @@ export interface PathEntry {
   readonly normalizedName: string;
   readonly normalizedPath: string;
   readonly normalizedWorkspaceName: string;
-  readonly searchIdentity: string;
+  readonly searchIdentity?: string;
 }
 
 export interface PathEntrySource {
-  readonly uri: vscode.Uri;
+  readonly uri?: vscode.Uri;
   readonly kind: PathEntryKind;
   readonly name: string;
   readonly relativePath: string;
@@ -35,6 +35,5 @@ export function createPathEntry(source: PathEntrySource): PathEntry {
     normalizedPath: source.normalizedPath ?? normalizeSearchText(source.relativePath),
     normalizedWorkspaceName:
       source.normalizedWorkspaceName ?? normalizeSearchText(source.workspaceName),
-    searchIdentity: `${source.workspaceUri}\0${source.kind}\0${source.relativePath}`,
   };
 }

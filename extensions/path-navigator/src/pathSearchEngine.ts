@@ -21,6 +21,12 @@ export interface PathSearchProgress {
   readonly complete: boolean;
   readonly processedCandidates: number;
   readonly truncated: boolean;
+  readonly reusableCandidates?: readonly PathEntry[];
+}
+
+export interface PathSearchReuse {
+  readonly entries: readonly PathEntry[];
+  readonly exhaustive: boolean;
 }
 
 export interface PathSearchRequest {
@@ -36,6 +42,7 @@ export interface PathSearchRequest {
   readonly includeFiles?: boolean;
   readonly includeDirectories?: boolean;
   readonly fuzzyMatching?: boolean;
+  readonly reuse?: PathSearchReuse;
   readonly isCancelled: () => boolean;
   readonly onProgress: (progress: PathSearchProgress) => void;
   readonly now?: number;
@@ -67,26 +74,35 @@ function candidateSources(
   normalizedQuery: string,
   scopePath: string,
   workspaceUri?: string,
+  reuse?: PathSearchReuse,
 ): readonly Iterable<PathEntry>[] {
+  const reusedSources: Iterable<PathEntry>[] = reuse ? [reuse.entries] : [];
+  if (reuse?.exhaustive) {
+    return reusedSources;
+  }
   if (normalizedQuery.length === 0) {
-    return [catalog.directChildren(scopePath, workspaceUri)];
+    return [...reusedSources, catalog.directChildren(scopePath, workspaceUri)];
   }
   if (normalizedQuery.length === 1) {
     return [
+      ...reusedSources,
       catalog.exactNameCandidates(normalizedQuery, workspaceUri),
       catalog.prefixCandidates(normalizedQuery, workspaceUri),
     ];
   }
   if (normalizedQuery.length === 2) {
     return [
+      ...reusedSources,
       catalog.exactNameCandidates(normalizedQuery, workspaceUri),
       catalog.prefixCandidates(normalizedQuery, workspaceUri),
       catalog.bigramCandidates(normalizedQuery, workspaceUri),
     ];
   }
   return [
+    ...reusedSources,
     catalog.exactNameCandidates(normalizedQuery, workspaceUri),
     catalog.prefixCandidates(normalizedQuery, workspaceUri),
+    catalog.intersectingNgramCandidates(normalizedQuery, workspaceUri),
     catalog.ngramCandidates(normalizedQuery, workspaceUri),
     catalog.workspaceCandidates(workspaceUri),
   ];
@@ -134,6 +150,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
   const normalizedScope = normalizeSearchText(request.scopePath).replace(/\/$/, '');
   const ranker = new TopKPathRanker<PathEntry>(request.maxResults);
   const seenIdentities = new Set<string>();
+  const reusableCandidates: PathEntry[] = [];
   const now = request.now ?? Date.now();
   let inspectedCandidates = 0;
   let processedCandidates = 0;
@@ -170,6 +187,9 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     }
     seenIdentities.add(identity);
     ranker.consider(entry, score + usageScoreBoost(usage, now));
+    if (request.catalog.getEntry(identity)) {
+      reusableCandidates.push(entry);
+    }
   }
 
   const publish = (complete: boolean): void => {
@@ -178,6 +198,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       complete,
       processedCandidates,
       truncated,
+      reusableCandidates: complete ? reusableCandidates : undefined,
     });
   };
 
@@ -201,6 +222,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     normalizedQuery,
     request.scopePath,
     request.workspaceUri,
+    request.reuse,
   );
 
   for (const entry of combineCandidates(sources)) {
@@ -249,10 +271,15 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       break;
     }
     processedCandidates += 1;
-    ranker.consider(
+    const score = scorePathWithNormalizedQuery(
       entry,
-      scorePathWithNormalizedQuery(entry, normalizedQuery, request.fuzzyMatching !== false),
+      normalizedQuery,
+      request.fuzzyMatching !== false,
     );
+    ranker.consider(entry, score);
+    if (score !== undefined) {
+      reusableCandidates.push(entry);
+    }
   }
 
   if (!request.isCancelled()) {

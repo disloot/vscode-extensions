@@ -44,6 +44,7 @@ test('catalog provides exact, prefix, and n-gram candidate pools', () => {
   assert.deepEqual(paths(catalog.prefixCandidates('mai')), ['src/main.py']);
   assert.deepEqual(paths(catalog.bigramCandidates('ile')), ['src/file.ts']);
   assert.deepEqual(paths(catalog.ngramCandidates('main')), ['src/main.py']);
+  assert.deepEqual(paths(catalog.intersectingNgramCandidates('main')), ['src/main.py']);
 });
 
 test('catalog keeps workspace candidate pools isolated', () => {
@@ -82,4 +83,50 @@ test('catalog revision changes only when new entries are accepted', () => {
   assert.equal(catalog.revision, 1);
   catalog.addEntries([entry('src/other.ts')]);
   assert.equal(catalog.revision, 2);
+});
+
+test('catalog removes a directory subtree without leaking tombstoned results', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('src', 'directory'),
+    entry('src/components', 'directory'),
+    entry('src/components/Button.tsx'),
+    entry('src/index.ts'),
+    entry('README.md'),
+  ]);
+  catalog.seal();
+
+  assert.equal(catalog.removePath('file:///workspace', 'src', true), 4);
+  assert.deepEqual(paths(catalog.workspaceCandidates()), ['README.md']);
+  assert.deepEqual(paths(catalog.prefixCandidates('but')), []);
+  assert.equal(catalog.size, 1);
+  assert.ok(catalog.tombstoneRatio > 0.5);
+});
+
+test('sealed posting lists accept incremental additions', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries(
+    Array.from({ length: 64 }, (_, index) => entry(`src/common-${index}.ts`)),
+  );
+  catalog.seal();
+  catalog.addEntries([entry('src/common-late.ts')]);
+
+  assert.equal(paths(catalog.prefixCandidates('com')).length, 65);
+  assert.equal(catalog.getEntryByPath('file:///workspace', 'src/common-late.ts').name, 'common-late.ts');
+});
+
+test('catalog preserves paths that differ only by case on case-sensitive workspaces', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('src/Foo.ts'),
+    entry('src/foo.ts'),
+  ]);
+
+  assert.equal(catalog.size, 2);
+  assert.equal(catalog.getEntryByPath('file:///workspace', 'src/Foo.ts').relativePath, 'src/Foo.ts');
+  assert.equal(catalog.getEntryByPath('file:///workspace', 'src/foo.ts').relativePath, 'src/foo.ts');
+  assert.deepEqual(paths(catalog.exactNameCandidates('foo.ts')).sort(), [
+    'src/Foo.ts',
+    'src/foo.ts',
+  ]);
 });
