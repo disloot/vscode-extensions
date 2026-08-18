@@ -50,6 +50,41 @@ test('limits the number of results', () => {
   assert.equal(results.length, 2);
 });
 
+test('top-k ranking matches a complete reference sort', () => {
+  const paths = Array.from({ length: 500 }, (_, index) =>
+    entry(
+      `${index % 9 === 0 ? 'src/components' : 'packages/module'}/${String(index).padStart(3, '0')}-file.ts`,
+      index % 17 === 0 ? 'directory' : 'file',
+      index % 2 === 0 ? 'alpha' : 'beta',
+    ),
+  );
+  const query = 'file';
+  const expected = paths
+    .map((item, inputIndex) => ({ item, inputIndex, score: scorePath(item, query) }))
+    .filter(({ score }) => score !== undefined)
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      if (left.item.kind !== right.item.kind) {
+        return left.item.kind === 'directory' ? -1 : 1;
+      }
+      const pathComparison = left.item.relativePath.localeCompare(right.item.relativePath);
+      return pathComparison !== 0 ? pathComparison : left.inputIndex - right.inputIndex;
+    })
+    .slice(0, 25)
+    .map(({ item }) => item.relativePath);
+
+  assert.deepEqual(
+    rankPaths(paths, query, 25).map(({ item }) => item.relativePath),
+    expected,
+  );
+});
+
+test('returns no ranked paths when the result limit is zero', () => {
+  assert.deepEqual(rankPaths([entry('src/file.ts')], 'file', 0), []);
+});
+
 test('parses the current directory and query from path input', () => {
   assert.deepEqual(parsePathInput('abc/bcd/cd'), {
     scopePath: 'abc/bcd',

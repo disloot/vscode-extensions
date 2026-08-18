@@ -11,6 +11,11 @@ workspace-relative paths.
 - Reveal and select directories in the built-in Explorer.
 - Index empty directories as well as files.
 - Keep the index updated when files or directories are created or deleted.
+- Preserve keyboard selection while background indexing adds or reorders results.
+- Keep large-workspace searches responsive by retaining only the highest-ranked results.
+- Pause candidate-list replacement as soon as you navigate results with the keyboard or mouse.
+- Search asynchronously in cancellable 8 ms slices with a configurable time and candidate budget.
+- Prioritize recently and frequently opened workspace files using workspace-local history.
 - Support multi-root, remote, and virtual workspaces through `workspace.fs`.
 
 ## Usage
@@ -30,6 +35,17 @@ Global search and directory navigation work together. Given
 immediately. After completing `abc/` with Tab, the same search only returns
 matches located somewhere inside `abc/`.
 
+Large workspaces use staged candidate retrieval. A one-character query searches
+recent paths and file-name prefixes. A two-character query searches prefixes and
+continuous name substrings. Queries of three or more characters use the rarest
+available name n-gram followed by a bounded fuzzy fallback. Exact, prefix, recent, and
+frequently opened results are evaluated before the fallback budget is consumed.
+
+When you move the active result with the keyboard or mouse, Path Navigator pauses
+visible-list replacement so background indexing and searching cannot move your
+selection. Editing the query, entering a directory, pressing refresh, or reopening
+the picker starts a fresh result stream.
+
 For example, the path `abc/bcd/cde` can be reached as follows:
 
 ```text
@@ -40,6 +56,20 @@ cd  → Tab → abc/bcd/cde
 
 The refresh button in the picker rebuilds the path index. You can also run
 **Path Navigator: Refresh Path Index**.
+
+## Performance settings
+
+- `pathNavigator.maxResults`: maximum visible results (default `200`).
+- `pathNavigator.maxSearchCandidates`: maximum expanded fuzzy candidates
+  scored per query (default `10000`).
+- `pathNavigator.searchTimeBudgetMs`: soft fuzzy-search budget in milliseconds
+  (default `150`).
+- `pathNavigator.recentPathsLimit`: workspace-local recent/frequent history
+  limit (default `200`, or `0` to disable).
+
+The history stores path metadata, timestamps, and open counts only—never file
+contents. It also observes workspace files opened through the normal editor, not
+only files opened through Path Navigator.
 
 ## Remote workspaces
 

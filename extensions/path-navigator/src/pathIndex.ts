@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { PathEntry } from './pathEntry';
+import { PathSearchCatalog } from './pathSearchCatalog';
 
 interface IndexSnapshot {
   readonly errors: readonly string[];
@@ -20,6 +21,7 @@ export class PathIndex implements vscode.Disposable {
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   private readonly statusEmitter = new vscode.EventEmitter<boolean>();
   private entries: readonly PathEntry[] = [];
+  private searchCatalog = new PathSearchCatalog();
   private rebuildPromise: Promise<void> | undefined;
   private rebuildTimer: NodeJS.Timeout | undefined;
   private generation = 0;
@@ -50,6 +52,10 @@ export class PathIndex implements vscode.Disposable {
 
   get currentEntries(): readonly PathEntry[] {
     return this.entries;
+  }
+
+  get currentSearchCatalog(): PathSearchCatalog {
+    return this.searchCatalog;
   }
 
   async ensureReady(): Promise<readonly PathEntry[]> {
@@ -84,6 +90,7 @@ export class PathIndex implements vscode.Disposable {
           .map((name) => name.toLocaleLowerCase()),
       );
       const collectedEntries: PathEntry[] = [];
+      const buildingSearchCatalog = new PathSearchCatalog();
       let publishedEntryCount = 0;
       let lastPublishedAt = 0;
 
@@ -104,6 +111,7 @@ export class PathIndex implements vscode.Disposable {
         }
 
         this.entries = [...collectedEntries];
+        this.searchCatalog = buildingSearchCatalog;
         publishedEntryCount = collectedEntries.length;
         lastPublishedAt = now;
         this.changeEmitter.fire();
@@ -116,6 +124,7 @@ export class PathIndex implements vscode.Disposable {
             excludedNames,
             (entries) => {
               collectedEntries.push(...entries);
+              buildingSearchCatalog.addEntries(entries);
               publishProgress();
             },
             () => requestedGeneration === this.generation,

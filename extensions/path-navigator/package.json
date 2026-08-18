@@ -2,7 +2,7 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
   "license": "SEE LICENSE IN LICENSE",
@@ -87,6 +87,27 @@
           "minimum": 20,
           "maximum": 2000,
           "description": "Maximum number of matching files and directories shown in the picker."
+        },
+        "pathNavigator.maxSearchCandidates": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "maximum": 100000,
+          "description": "Maximum number of indexed paths scored by an expanded fuzzy search. One- and two-character searches use lower internal limits."
+        },
+        "pathNavigator.searchTimeBudgetMs": {
+          "type": "number",
+          "default": 150,
+          "minimum": 25,
+          "maximum": 2000,
+          "description": "Soft time budget in milliseconds for an expanded fuzzy search. Exact, prefix, and recent-path candidates are considered first."
+        },
+        "pathNavigator.recentPathsLimit": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "maximum": 1000,
+          "description": "Maximum number of recently and frequently opened workspace paths retained locally for ranking. Set to 0 to disable history."
         },
         "pathNavigator.excludeDirectoryNames": {
           "type": "array",

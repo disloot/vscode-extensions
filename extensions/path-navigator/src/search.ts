@@ -15,12 +15,16 @@ export interface ParsedPathInput {
   readonly query: string;
 }
 
-function normalize(value: string): string {
+interface HeapPath<T extends SearchablePath> extends RankedPath<T> {
+  readonly inputIndex: number;
+}
+
+export function normalizeSearchText(value: string): string {
   return value.replace(/\\/g, '/').replace(/^\.\//, '').toLocaleLowerCase();
 }
 
-function compactQuery(value: string): string {
-  return normalize(value).replace(/\s+/g, '');
+export function normalizeSearchQuery(value: string): string {
+  return normalizeSearchText(value).replace(/\s+/g, '');
 }
 
 export function parsePathInput(value: string): ParsedPathInput {
@@ -42,15 +46,15 @@ export function parsePathInput(value: string): ParsedPathInput {
 }
 
 export function isDirectChild(relativePath: string, scopePath: string): boolean {
-  const normalizedPath = normalize(relativePath);
+  const normalizedPath = normalizeSearchText(relativePath);
   const separatorIndex = normalizedPath.lastIndexOf('/');
   const parentPath = separatorIndex < 0 ? '' : normalizedPath.slice(0, separatorIndex);
-  return parentPath === normalize(scopePath);
+  return parentPath === normalizeSearchText(scopePath);
 }
 
 export function isDescendantOfScope(relativePath: string, scopePath: string): boolean {
-  const normalizedPath = normalize(relativePath);
-  const normalizedScope = normalize(scopePath).replace(/\/$/, '');
+  const normalizedPath = normalizeSearchText(relativePath);
+  const normalizedScope = normalizeSearchText(scopePath).replace(/\/$/, '');
   return normalizedScope.length === 0 || normalizedPath.startsWith(`${normalizedScope}/`);
 }
 
@@ -78,14 +82,20 @@ function subsequenceScore(candidate: string, query: string): number | undefined 
 }
 
 export function scorePath(item: SearchablePath, rawQuery: string): number | undefined {
-  const query = compactQuery(rawQuery);
+  return scorePathWithNormalizedQuery(item, normalizeSearchQuery(rawQuery));
+}
+
+export function scorePathWithNormalizedQuery(
+  item: SearchablePath,
+  query: string,
+): number | undefined {
   if (!query) {
     return item.kind === 'directory' ? 10 : 0;
   }
 
-  const path = normalize(item.relativePath);
-  const name = normalize(item.name);
-  const workspace = normalize(item.workspaceName);
+  const path = normalizeSearchText(item.relativePath);
+  const name = normalizeSearchText(item.name);
+  const workspace = normalizeSearchText(item.workspaceName);
   const searchablePath = `${workspace}/${path}`;
 
   if (path === query || searchablePath === query) {
@@ -119,22 +129,104 @@ export function scorePath(item: SearchablePath, rawQuery: string): number | unde
   return subsequenceScore(searchablePath, query);
 }
 
+function compareRankedPaths<T extends SearchablePath>(
+  left: HeapPath<T>,
+  right: HeapPath<T>,
+): number {
+  if (right.score !== left.score) {
+    return right.score - left.score;
+  }
+  if (left.item.kind !== right.item.kind) {
+    return left.item.kind === 'directory' ? -1 : 1;
+  }
+  const pathComparison = left.item.relativePath.localeCompare(right.item.relativePath);
+  return pathComparison !== 0 ? pathComparison : left.inputIndex - right.inputIndex;
+}
+
+function isWorse<T extends SearchablePath>(left: HeapPath<T>, right: HeapPath<T>): boolean {
+  return compareRankedPaths(left, right) > 0;
+}
+
+function pushWorstFirst<T extends SearchablePath>(heap: HeapPath<T>[], value: HeapPath<T>): void {
+  heap.push(value);
+  let index = heap.length - 1;
+
+  while (index > 0) {
+    const parentIndex = Math.floor((index - 1) / 2);
+    if (!isWorse(heap[index], heap[parentIndex])) {
+      return;
+    }
+    [heap[index], heap[parentIndex]] = [heap[parentIndex], heap[index]];
+    index = parentIndex;
+  }
+}
+
+function replaceWorst<T extends SearchablePath>(heap: HeapPath<T>[], value: HeapPath<T>): void {
+  heap[0] = value;
+  let index = 0;
+
+  while (true) {
+    const leftIndex = index * 2 + 1;
+    const rightIndex = leftIndex + 1;
+    let worstIndex = index;
+
+    if (leftIndex < heap.length && isWorse(heap[leftIndex], heap[worstIndex])) {
+      worstIndex = leftIndex;
+    }
+    if (rightIndex < heap.length && isWorse(heap[rightIndex], heap[worstIndex])) {
+      worstIndex = rightIndex;
+    }
+    if (worstIndex === index) {
+      return;
+    }
+
+    [heap[index], heap[worstIndex]] = [heap[worstIndex], heap[index]];
+    index = worstIndex;
+  }
+}
+
+export class TopKPathRanker<T extends SearchablePath> {
+  private readonly bestResults: HeapPath<T>[] = [];
+  private readonly limit: number;
+  private inputIndex = 0;
+
+  constructor(maxResults: number) {
+    this.limit = Number.isFinite(maxResults)
+      ? Math.max(0, Math.floor(maxResults))
+      : 0;
+  }
+
+  consider(item: T, score: number | undefined): void {
+    const inputIndex = this.inputIndex;
+    this.inputIndex += 1;
+    if (score === undefined || this.limit === 0) {
+      return;
+    }
+
+    const candidate: HeapPath<T> = { item, score, inputIndex };
+    if (this.bestResults.length < this.limit) {
+      pushWorstFirst(this.bestResults, candidate);
+    } else if (compareRankedPaths(candidate, this.bestResults[0]) < 0) {
+      replaceWorst(this.bestResults, candidate);
+    }
+  }
+
+  results(): RankedPath<T>[] {
+    return [...this.bestResults]
+      .sort(compareRankedPaths)
+      .map(({ item, score }) => ({ item, score }));
+  }
+}
+
 export function rankPaths<T extends SearchablePath>(
-  items: readonly T[],
+  items: Iterable<T>,
   query: string,
   maxResults: number,
 ): RankedPath<T>[] {
-  return items
-    .map((item) => ({ item, score: scorePath(item, query) }))
-    .filter((result): result is RankedPath<T> => result.score !== undefined)
-    .sort((left, right) => {
-      if (right.score !== left.score) {
-        return right.score - left.score;
-      }
-      if (left.item.kind !== right.item.kind) {
-        return left.item.kind === 'directory' ? -1 : 1;
-      }
-      return left.item.relativePath.localeCompare(right.item.relativePath);
-    })
-    .slice(0, maxResults);
+  const ranker = new TopKPathRanker<T>(maxResults);
+  const normalizedQuery = normalizeSearchQuery(query);
+  for (const item of items) {
+    ranker.consider(item, scorePathWithNormalizedQuery(item, normalizedQuery));
+  }
+  return ranker.results();
 }
