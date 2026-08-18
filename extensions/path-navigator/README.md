@@ -23,7 +23,7 @@ workspace-relative paths.
 - Intersect multiple compact name n-gram posting lists before broad fuzzy fallback.
 - Prioritize recently and frequently opened workspace files using workspace-local history.
 - Pin important files and directories directly from their result-row star button.
-- Restore a compressed binary index on startup and reconcile it in the background.
+- Restore a streamed compressed index on startup and reconcile it in the background.
 - Optionally build a shallow initial index and load a directory subtree when it is entered.
 - Optionally accelerate full scans with Git, fd, or ripgrep on the workspace host.
 - Support multi-root, remote, and virtual workspaces through `workspace.fs`.
@@ -50,7 +50,9 @@ Prefix the input with `//` when slashes should be part of a global full-path que
 instead of an exact directory scope. For example, `//src/comp/button` can rank
 `src/components/Button.tsx` without completing `src/` and `components/` first.
 
-Large workspaces use compact numeric posting lists and staged candidate retrieval. A one-character query searches
+Large workspaces use compact numeric posting lists and staged candidate retrieval. Candidate
+retrieval, reuse, and deduplication remain numeric until the final Top-K paths are displayed.
+A one-character query searches
 recent paths and file-name prefixes. A two-character query searches prefixes and
 continuous name substrings. Queries of three or more characters first intersect several
 selective name n-grams, then use the rarest available n-gram followed by a bounded fuzzy
@@ -125,7 +127,8 @@ the Keyboard Shortcuts editor.
 - `pathNavigator.maxResults`: maximum visible results (default `200`).
 - `pathNavigator.maxIndexEntries`: maximum retained index size (default `500000`,
   or `0` for unlimited). The picker reports when the limit is reached.
-- `pathNavigator.indexConcurrency`: concurrent directory reads during indexing
+- `pathNavigator.indexConcurrency`: concurrent directory reads from a shared work queue
+  during indexing
   (default `12`; lower values may suit constrained remote workspaces).
 - `pathNavigator.autoRefreshIndex`: apply incremental file/directory updates
   (default `true`).

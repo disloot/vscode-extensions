@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { LruCache } from './lruCache';
 import { PathEntry } from './pathEntry';
 import { PathIndex } from './pathIndex';
+import type { PathEntryId } from './pathSearchCatalog';
 import { searchPaths, type PathSearchProgress } from './pathSearchEngine';
 import { RecentPathStore } from './recentPaths';
 import {
@@ -31,7 +32,7 @@ const SEARCH_CACHE_SIZE = 32;
 interface ReusableSearchState {
   readonly contextKey: string;
   readonly normalizedQuery: string;
-  readonly entries: readonly PathEntry[];
+  readonly entryIds: readonly PathEntryId[];
   readonly exhaustive: boolean;
 }
 
@@ -351,7 +352,7 @@ export class PathPicker {
         normalizedQuery.startsWith(previousReusableSearch.normalizedQuery);
       const reuse = canReusePrevious
         ? {
-            entries: previousReusableSearch.entries,
+            entryIds: previousReusableSearch.entryIds,
             exhaustive: previousReusableSearch.exhaustive,
           }
         : undefined;
@@ -422,11 +423,11 @@ export class PathPicker {
             reusableSearch = {
               contextKey: reuseContextKey,
               normalizedQuery,
-              entries: progress.reusableCandidates ?? progress.entries,
+              entryIds: progress.reusableCandidateIds ?? [],
               exhaustive:
                 normalizedQuery.length >= 3 &&
                 !progress.truncated &&
-                progress.reusableCandidates !== undefined,
+                progress.reusableCandidateIds !== undefined,
             };
             if (
               !this.index.isBuilding &&

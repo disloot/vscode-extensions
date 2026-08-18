@@ -12,6 +12,7 @@ interface PackedIdBucket {
 
 type IdBucket = number | number[] | PackedIdBucket;
 type BucketMap = Map<string, IdBucket>;
+export type PathEntryId = number;
 
 interface WorkspaceCatalog {
   readonly uri: string;
@@ -73,6 +74,37 @@ function bucketLength(bucket: IdBucket | undefined): number {
   return Array.isArray(bucket)
     ? bucket.length
     : bucket.packed.length + (bucket.tail?.length ?? 0);
+}
+
+function sortedValuesContain(values: ArrayLike<number>, target: number): boolean {
+  let low = 0;
+  let high = values.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >>> 1;
+    const value = values[middle];
+    if (value === target) {
+      return true;
+    }
+    if (value < target) {
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return false;
+}
+
+function bucketContains(bucket: IdBucket, entryId: number): boolean {
+  if (typeof bucket === 'number') {
+    return bucket === entryId;
+  }
+  if (Array.isArray(bucket)) {
+    return sortedValuesContain(bucket, entryId);
+  }
+  return (
+    sortedValuesContain(bucket.packed, entryId) ||
+    (bucket.tail !== undefined && sortedValuesContain(bucket.tail, entryId))
+  );
 }
 
 function packBuckets(buckets: BucketMap): void {
@@ -145,6 +177,10 @@ export class PathSearchCatalog {
     return this.activeEntryCount;
   }
 
+  get capacity(): number {
+    return this.entries.length;
+  }
+
   get revision(): number {
     return this.catalogRevision;
   }
@@ -215,6 +251,11 @@ export class PathSearchCatalog {
   }
 
   getEntry(identity: string): PathEntry | undefined {
+    const entryId = this.getEntryId(identity);
+    return entryId === undefined ? undefined : this.entries[entryId];
+  }
+
+  getEntryId(identity: string): PathEntryId | undefined {
     const workspaceSeparator = identity.indexOf('\0');
     const kindSeparator = identity.indexOf('\0', workspaceSeparator + 1);
     if (workspaceSeparator < 0 || kindSeparator < 0) {
@@ -222,8 +263,20 @@ export class PathSearchCatalog {
     }
     const workspaceUri = identity.slice(0, workspaceSeparator);
     const kind = identity.slice(workspaceSeparator + 1, kindSeparator);
-    const entry = this.getEntryByPath(workspaceUri, identity.slice(kindSeparator + 1));
-    return entry?.kind === kind ? entry : undefined;
+    const workspace = this.workspaces.get(workspaceUri);
+    if (!workspace) {
+      return undefined;
+    }
+    const entryId = this.findPathEntryId(
+      workspace,
+      identity.slice(kindSeparator + 1),
+    );
+    const entry = entryId === undefined ? undefined : this.entries[entryId];
+    return entry?.kind === kind ? entryId : undefined;
+  }
+
+  getEntryById(entryId: PathEntryId): PathEntry | undefined {
+    return this.entries[entryId];
   }
 
   getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined {
@@ -307,10 +360,22 @@ export class PathSearchCatalog {
     return this.bucketEntries('childrenByParent', normalizedScope, workspaceUri);
   }
 
+  directChildIds(scopePath: string, workspaceUri?: string): Iterable<PathEntryId> {
+    const normalizedScope = normalizeSearchText(scopePath).replace(/\/$/, '');
+    return this.bucketEntryIds('childrenByParent', normalizedScope, workspaceUri);
+  }
+
   exactNameCandidates(query: string, workspaceUri?: string): Iterable<PathEntry> {
     const normalizedQuery = normalizeSearchQuery(query);
     return normalizedQuery
       ? this.bucketEntries('entriesByExactName', normalizedQuery, workspaceUri)
+      : [];
+  }
+
+  exactNameCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    const normalizedQuery = normalizeSearchQuery(query);
+    return normalizedQuery
+      ? this.bucketEntryIds('entriesByExactName', normalizedQuery, workspaceUri)
       : [];
   }
 
@@ -323,6 +388,18 @@ export class PathSearchCatalog {
     return this.bucketEntries('entriesByNamePrefix', prefix, workspaceUri);
   }
 
+  prefixCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    const normalizedQuery = normalizeSearchQuery(query);
+    if (!normalizedQuery) {
+      return [];
+    }
+    return this.bucketEntryIds(
+      'entriesByNamePrefix',
+      normalizedQuery.slice(0, Math.min(3, normalizedQuery.length)),
+      workspaceUri,
+    );
+  }
+
   bigramCandidates(query: string, workspaceUri?: string): Iterable<PathEntry> {
     const normalizedQuery = normalizeSearchQuery(query);
     return normalizedQuery.length < 2
@@ -330,13 +407,32 @@ export class PathSearchCatalog {
       : this.bucketEntries('entriesByBigram', normalizedQuery.slice(0, 2), workspaceUri);
   }
 
+  bigramCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    const normalizedQuery = normalizeSearchQuery(query);
+    return normalizedQuery.length < 2
+      ? []
+      : this.bucketEntryIds('entriesByBigram', normalizedQuery.slice(0, 2), workspaceUri);
+  }
+
   ngramCandidates(query: string, workspaceUri?: string): Iterable<PathEntry> {
+    const catalog = this;
+    return (function* (): IterableIterator<PathEntry> {
+      for (const entryId of catalog.ngramCandidateIds(query, workspaceUri)) {
+        const entry = catalog.entries[entryId];
+        if (entry) {
+          yield entry;
+        }
+      }
+    })();
+  }
+
+  ngramCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
     const normalizedQuery = normalizeSearchQuery(query);
     if (normalizedQuery.length < 2) {
       return [];
     }
     const catalog = this;
-    return (function* (): IterableIterator<PathEntry> {
+    return (function* (): IterableIterator<PathEntryId> {
       for (const workspace of catalog.selectedWorkspaces(workspaceUri)) {
         let rarestBucket: IdBucket | undefined;
         let rarestCount = Number.POSITIVE_INFINITY;
@@ -348,18 +444,33 @@ export class PathSearchCatalog {
             rarestCount = count;
           }
         }
-        yield* catalog.activeEntries(bucketIds(rarestBucket));
+        yield* catalog.activeEntryIds(bucketIds(rarestBucket));
       }
     })();
   }
 
   intersectingNgramCandidates(query: string, workspaceUri?: string): Iterable<PathEntry> {
+    const catalog = this;
+    return (function* (): IterableIterator<PathEntry> {
+      for (const entryId of catalog.intersectingNgramCandidateIds(query, workspaceUri)) {
+        const entry = catalog.entries[entryId];
+        if (entry) {
+          yield entry;
+        }
+      }
+    })();
+  }
+
+  intersectingNgramCandidateIds(
+    query: string,
+    workspaceUri?: string,
+  ): Iterable<PathEntryId> {
     const normalizedQuery = normalizeSearchQuery(query);
     if (normalizedQuery.length < 3) {
       return [];
     }
     const catalog = this;
-    return (function* (): IterableIterator<PathEntry> {
+    return (function* (): IterableIterator<PathEntryId> {
       for (const workspace of catalog.selectedWorkspaces(workspaceUri)) {
         const buckets = [...uniqueNgrams(normalizedQuery, 2)]
           .map((gram) => workspace.entriesByBigram.get(gram))
@@ -369,13 +480,12 @@ export class PathSearchCatalog {
         if (buckets.length < 2) {
           continue;
         }
-        const membership = buckets.slice(1).map((bucket) => new Set(bucketIds(bucket)));
         for (const entryId of bucketIds(buckets[0])) {
-          if (membership.every((ids) => ids.has(entryId))) {
-            const entry = catalog.entries[entryId];
-            if (entry) {
-              yield entry;
-            }
+          if (
+            catalog.entries[entryId] &&
+            buckets.slice(1).every((bucket) => bucketContains(bucket, entryId))
+          ) {
+            yield entryId;
           }
         }
       }
@@ -385,8 +495,20 @@ export class PathSearchCatalog {
   workspaceCandidates(workspaceUri?: string): Iterable<PathEntry> {
     const catalog = this;
     return (function* (): IterableIterator<PathEntry> {
+      for (const entryId of catalog.workspaceCandidateIds(workspaceUri)) {
+        const entry = catalog.entries[entryId];
+        if (entry) {
+          yield entry;
+        }
+      }
+    })();
+  }
+
+  workspaceCandidateIds(workspaceUri?: string): Iterable<PathEntryId> {
+    const catalog = this;
+    return (function* (): IterableIterator<PathEntryId> {
       for (const workspace of catalog.selectedWorkspaces(workspaceUri)) {
-        yield* catalog.activeEntries(bucketIds(workspace.entryIds));
+        yield* catalog.activeEntryIds(bucketIds(workspace.entryIds));
       }
     })();
   }
@@ -395,11 +517,27 @@ export class PathSearchCatalog {
     return this.entries.filter((entry): entry is PathEntry => entry !== undefined);
   }
 
-  private *activeEntries(entryIds: Iterable<number>): IterableIterator<PathEntry> {
+  *activeEntries(): IterableIterator<PathEntry> {
+    for (const entry of this.entries) {
+      if (entry) {
+        yield entry;
+      }
+    }
+  }
+
+  private *activeEntriesFromIds(entryIds: Iterable<number>): IterableIterator<PathEntry> {
     for (const entryId of entryIds) {
       const entry = this.entries[entryId];
       if (entry) {
         yield entry;
+      }
+    }
+  }
+
+  private *activeEntryIds(entryIds: Iterable<number>): IterableIterator<PathEntryId> {
+    for (const entryId of entryIds) {
+      if (this.entries[entryId]) {
+        yield entryId;
       }
     }
   }
@@ -453,7 +591,24 @@ export class PathSearchCatalog {
     const catalog = this;
     return (function* (): IterableIterator<PathEntry> {
       for (const workspace of catalog.selectedWorkspaces(workspaceUri)) {
-        yield* catalog.activeEntries(bucketIds(workspace[bucketName].get(token)));
+        yield* catalog.activeEntriesFromIds(bucketIds(workspace[bucketName].get(token)));
+      }
+    })();
+  }
+
+  private bucketEntryIds(
+    bucketName:
+      | 'childrenByParent'
+      | 'entriesByExactName'
+      | 'entriesByNamePrefix'
+      | 'entriesByBigram',
+    token: string,
+    workspaceUri?: string,
+  ): Iterable<PathEntryId> {
+    const catalog = this;
+    return (function* (): IterableIterator<PathEntryId> {
+      for (const workspace of catalog.selectedWorkspaces(workspaceUri)) {
+        yield* catalog.activeEntryIds(bucketIds(workspace[bucketName].get(token)));
       }
     })();
   }

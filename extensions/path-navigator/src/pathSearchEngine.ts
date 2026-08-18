@@ -1,5 +1,5 @@
 import type { PathEntry } from './pathEntry';
-import { PathSearchCatalog } from './pathSearchCatalog';
+import { PathSearchCatalog, type PathEntryId } from './pathSearchCatalog';
 import { pathIdentity } from './resultSelection';
 import {
   isDescendantOfScope,
@@ -22,11 +22,11 @@ export interface PathSearchProgress {
   readonly complete: boolean;
   readonly processedCandidates: number;
   readonly truncated: boolean;
-  readonly reusableCandidates?: readonly PathEntry[];
+  readonly reusableCandidateIds?: readonly PathEntryId[];
 }
 
 export interface PathSearchReuse {
-  readonly entries: readonly PathEntry[];
+  readonly entryIds: readonly PathEntryId[];
   readonly exhaustive: boolean;
 }
 
@@ -74,8 +74,8 @@ function candidateQueryForRequest(normalizedQuery: string, globalPathQuery: bool
 }
 
 function* combineCandidates(
-  sources: readonly Iterable<PathEntry>[],
-): IterableIterator<PathEntry> {
+  sources: readonly Iterable<PathEntryId>[],
+): IterableIterator<PathEntryId> {
   for (const source of sources) {
     yield* source;
   }
@@ -87,36 +87,36 @@ function candidateSources(
   scopePath: string,
   workspaceUri?: string,
   reuse?: PathSearchReuse,
-): readonly Iterable<PathEntry>[] {
-  const reusedSources: Iterable<PathEntry>[] = reuse ? [reuse.entries] : [];
+): readonly Iterable<PathEntryId>[] {
+  const reusedSources: Iterable<PathEntryId>[] = reuse ? [reuse.entryIds] : [];
   if (reuse?.exhaustive) {
     return reusedSources;
   }
   if (normalizedQuery.length === 0) {
-    return [...reusedSources, catalog.directChildren(scopePath, workspaceUri)];
+    return [...reusedSources, catalog.directChildIds(scopePath, workspaceUri)];
   }
   if (normalizedQuery.length === 1) {
     return [
       ...reusedSources,
-      catalog.exactNameCandidates(normalizedQuery, workspaceUri),
-      catalog.prefixCandidates(normalizedQuery, workspaceUri),
+      catalog.exactNameCandidateIds(normalizedQuery, workspaceUri),
+      catalog.prefixCandidateIds(normalizedQuery, workspaceUri),
     ];
   }
   if (normalizedQuery.length === 2) {
     return [
       ...reusedSources,
-      catalog.exactNameCandidates(normalizedQuery, workspaceUri),
-      catalog.prefixCandidates(normalizedQuery, workspaceUri),
-      catalog.bigramCandidates(normalizedQuery, workspaceUri),
+      catalog.exactNameCandidateIds(normalizedQuery, workspaceUri),
+      catalog.prefixCandidateIds(normalizedQuery, workspaceUri),
+      catalog.bigramCandidateIds(normalizedQuery, workspaceUri),
     ];
   }
   return [
     ...reusedSources,
-    catalog.exactNameCandidates(normalizedQuery, workspaceUri),
-    catalog.prefixCandidates(normalizedQuery, workspaceUri),
-    catalog.intersectingNgramCandidates(normalizedQuery, workspaceUri),
-    catalog.ngramCandidates(normalizedQuery, workspaceUri),
-    catalog.workspaceCandidates(workspaceUri),
+    catalog.exactNameCandidateIds(normalizedQuery, workspaceUri),
+    catalog.prefixCandidateIds(normalizedQuery, workspaceUri),
+    catalog.intersectingNgramCandidateIds(normalizedQuery, workspaceUri),
+    catalog.ngramCandidateIds(normalizedQuery, workspaceUri),
+    catalog.workspaceCandidateIds(workspaceUri),
   ];
 }
 
@@ -165,8 +165,8 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
   );
   const normalizedScope = normalizeSearchText(request.scopePath).replace(/\/$/, '');
   const ranker = new TopKPathRanker<PathEntry>(request.maxResults);
-  const seenIdentities = new Set<string>();
-  const reusableCandidates: PathEntry[] = [];
+  const seenEntryIds = new Uint8Array(request.catalog.capacity);
+  const reusableCandidateIds: PathEntryId[] = [];
   const now = request.now ?? Date.now();
   let inspectedCandidates = 0;
   let processedCandidates = 0;
@@ -174,8 +174,9 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
 
   for (const usage of request.recentPaths) {
     const identity = pathIdentity(usage.entry);
+    const entryId = request.catalog.getEntryId(identity);
     const entry =
-      request.catalog.getEntry(identity) ??
+      (entryId === undefined ? undefined : request.catalog.getEntryById(entryId)) ??
       (request.allowUnindexedRecentPaths ? usage.entry : undefined);
     if (!entry) {
       continue;
@@ -201,10 +202,12 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     if (score === undefined) {
       continue;
     }
-    seenIdentities.add(identity);
+    if (entryId !== undefined) {
+      seenEntryIds[entryId] = 1;
+    }
     ranker.consider(entry, score + usageScoreBoost(usage, now));
-    if (request.catalog.getEntry(identity)) {
-      reusableCandidates.push(entry);
+    if (entryId !== undefined) {
+      reusableCandidateIds.push(entryId);
     }
   }
 
@@ -214,7 +217,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       complete,
       processedCandidates,
       truncated,
-      reusableCandidates: complete ? reusableCandidates : undefined,
+      reusableCandidateIds: complete ? reusableCandidateIds : undefined,
     });
   };
 
@@ -241,7 +244,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     request.reuse,
   );
 
-  for (const entry of combineCandidates(sources)) {
+  for (const entryId of combineCandidates(sources)) {
     inspectedCandidates += 1;
     if (inspectedCandidates % CANCELLATION_CHECK_INTERVAL === 0) {
       const currentTime = performance.now();
@@ -268,15 +271,14 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       }
     }
 
-    if (!entryKindIsIncluded(entry, request)) {
+    if (seenEntryIds[entryId] !== 0) {
       continue;
     }
-
-    const identity = pathIdentity(entry);
-    if (seenIdentities.has(identity)) {
+    seenEntryIds[entryId] = 1;
+    const entry = request.catalog.getEntryById(entryId);
+    if (!entry || !entryKindIsIncluded(entry, request)) {
       continue;
     }
-    seenIdentities.add(identity);
 
     const directChildrenOnly = normalizedQuery.length === 0;
     if (
@@ -297,7 +299,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     );
     ranker.consider(entry, score);
     if (score !== undefined) {
-      reusableCandidates.push(entry);
+      reusableCandidateIds.push(entryId);
     }
   }
 

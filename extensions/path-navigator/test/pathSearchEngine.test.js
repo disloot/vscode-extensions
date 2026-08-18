@@ -213,10 +213,22 @@ test('an exhaustive previous query can be reused without scanning unrelated cata
   const unrelated = Array.from({ length: 500 }, (_, index) =>
     entry(`src/component-${index}.ts`),
   );
-  const progress = await search([reusable, ...unrelated], {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([reusable, ...unrelated]);
+  const reusableId = catalog.getEntryId(`file:///workspace\0file\0${reusable.relativePath}`);
+  const progress = [];
+  await searchPaths({
+    catalog,
+    scopePath: '',
     query: 'main',
-    reuse: { entries: [reusable], exhaustive: true },
+    reuse: { entryIds: [reusableId], exhaustive: true },
     maxCandidates: 1,
+    maxResults: 200,
+    timeBudgetMs: 1_000,
+    recentPaths: [],
+    allowUnindexedRecentPaths: false,
+    isCancelled: () => false,
+    onProgress: (value) => progress.push(value),
   });
   const final = progress.at(-1);
 
@@ -227,9 +239,23 @@ test('an exhaustive previous query can be reused without scanning unrelated cata
 
 test('a non-exhaustive reused candidate pool still falls back to the live catalog', async () => {
   const target = entry('src/main.py');
-  const progress = await search([target], {
+  const other = entry('src/other.ts');
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([target, other]);
+  const otherId = catalog.getEntryId(`file:///workspace\0file\0${other.relativePath}`);
+  const progress = [];
+  await searchPaths({
+    catalog,
+    scopePath: '',
     query: 'main',
-    reuse: { entries: [entry('src/other.ts')], exhaustive: false },
+    reuse: { entryIds: [otherId], exhaustive: false },
+    maxCandidates: 10_000,
+    maxResults: 200,
+    timeBudgetMs: 1_000,
+    recentPaths: [],
+    allowUnindexedRecentPaths: false,
+    isCancelled: () => false,
+    onProgress: (value) => progress.push(value),
   });
 
   assert.equal(progress.at(-1).entries[0].relativePath, target.relativePath);

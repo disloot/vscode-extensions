@@ -2,7 +2,7 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
   "license": "MIT",

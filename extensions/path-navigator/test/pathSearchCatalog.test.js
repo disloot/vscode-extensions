@@ -130,3 +130,20 @@ test('catalog preserves paths that differ only by case on case-sensitive workspa
     'src/foo.ts',
   ]);
 });
+
+test('numeric candidate APIs preserve the same candidate membership', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('src/main.py'),
+    entry('src/domain.py'),
+    entry('src/result.ts'),
+  ]);
+
+  const idPaths = (ids) => [...ids].map((id) => catalog.getEntryById(id).relativePath);
+  assert.deepEqual(idPaths(catalog.prefixCandidateIds('mai')), ['src/main.py']);
+  assert.deepEqual(
+    idPaths(catalog.intersectingNgramCandidateIds('main')),
+    paths(catalog.intersectingNgramCandidates('main')),
+  );
+  assert.equal(catalog.capacity, 3);
+});

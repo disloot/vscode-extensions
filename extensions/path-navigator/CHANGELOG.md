@@ -1,5 +1,14 @@
 # Change Log
 
+## 0.7.0
+
+- Carry numeric entry IDs through candidate retrieval, reuse, and deduplication.
+- Replace per-query n-gram membership sets with ordered posting-list lookups.
+- Stream local extension-host cache compression and decompression in the v4 cache format.
+- Keep the v3 binary cache as a backward-compatible migration source.
+- Scan directories through a continuously fed concurrent work queue instead of level barriers.
+- Reserve a fair first-pass index share for every root in multi-root workspaces.
+
 ## 0.6.0
 
 - Update each bounded search atomically by default, with optional progressive snapshots.

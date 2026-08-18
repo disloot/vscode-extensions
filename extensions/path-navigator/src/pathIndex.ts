@@ -22,6 +22,7 @@ interface PendingDirectory {
   readonly uri: vscode.Uri;
   readonly relativePath: string;
   readonly normalizedPath: string;
+  readonly depth: number;
 }
 
 interface IndexConfiguration {
@@ -51,6 +52,58 @@ const DEFAULT_INCREMENTAL_UPDATE_BATCH_LIMIT = 2_000;
 const CATALOG_COMPACTION_TOMBSTONE_RATIO = 0.2;
 const CACHE_SAVE_DEBOUNCE_MS = 2_000;
 const CACHE_RESTORE_BATCH_SIZE = 5_000;
+
+async function scanDirectoryWorkQueue(
+  initialDirectories: readonly PendingDirectory[],
+  concurrency: number,
+  shouldContinue: () => boolean,
+  isPriority: (directory: PendingDirectory) => boolean,
+  scan: (directory: PendingDirectory) => Promise<readonly PendingDirectory[]>,
+): Promise<void> {
+  const priorityQueue: PendingDirectory[] = [];
+  const normalQueue = [...initialDirectories];
+  let normalIndex = 0;
+  let activeWorkers = 0;
+
+  const takeNext = (): PendingDirectory | undefined =>
+    priorityQueue.pop() ?? normalQueue[normalIndex++];
+  const hasPending = (): boolean =>
+    priorityQueue.length > 0 || normalIndex < normalQueue.length;
+
+  await new Promise<void>((resolve) => {
+    const schedule = (): void => {
+      while (activeWorkers < concurrency && hasPending() && shouldContinue()) {
+        const directory = takeNext();
+        if (!directory) {
+          break;
+        }
+        activeWorkers += 1;
+        void scan(directory)
+          .then((children) => {
+            for (const child of children) {
+              if (isPriority(child)) {
+                priorityQueue.push(child);
+              } else {
+                normalQueue.push(child);
+              }
+            }
+          })
+          .finally(() => {
+            activeWorkers -= 1;
+            if (activeWorkers === 0 && (!hasPending() || !shouldContinue())) {
+              resolve();
+            } else {
+              schedule();
+            }
+          });
+      }
+      if (activeWorkers === 0 && (!hasPending() || !shouldContinue())) {
+        resolve();
+      }
+    };
+    schedule();
+  });
+}
 
 export class PathIndex implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
@@ -238,36 +291,81 @@ export class PathIndex implements vscode.Disposable {
         this.changeEmitter.fire();
       };
 
-      const acceptEntries = (entries: readonly PathEntry[]): void => {
+      const acceptEntries = (
+        entries: readonly PathEntry[],
+        workspaceLimit = Number.POSITIVE_INFINITY,
+        workspaceAccepted?: { count: number },
+      ): void => {
         const uniqueEntries = entries.filter(
           (entry) =>
             !buildingSearchCatalog.getEntryByPath(entry.workspaceUri, entry.relativePath),
         );
-        const remaining = maxEntries === 0
+        const globalRemaining = maxEntries === 0
           ? uniqueEntries.length
           : Math.max(0, maxEntries - acceptedEntryCount);
+        const workspaceRemaining = workspaceAccepted
+          ? Math.max(0, workspaceLimit - workspaceAccepted.count)
+          : uniqueEntries.length;
+        const remaining = Math.min(globalRemaining, workspaceRemaining);
         const acceptedEntries =
           remaining >= uniqueEntries.length
             ? uniqueEntries
             : uniqueEntries.slice(0, remaining);
         if (acceptedEntries.length > 0) {
-          acceptedEntryCount += buildingSearchCatalog.addEntries(acceptedEntries);
+          const addedCount = buildingSearchCatalog.addEntries(acceptedEntries);
+          acceptedEntryCount += addedCount;
+          if (workspaceAccepted) {
+            workspaceAccepted.count += addedCount;
+          }
         }
         if (maxEntries > 0 && acceptedEntryCount >= maxEntries) {
           limitReached = true;
         }
         publishProgress();
       };
+      const fairShares = folders.map((_, index) => {
+        if (maxEntries === 0 || folders.length === 0) {
+          return Number.POSITIVE_INFINITY;
+        }
+        const baseShare = Math.floor(maxEntries / folders.length);
+        return baseShare + (index < maxEntries % folders.length ? 1 : 0);
+      });
+      const workspaceAccepted = folders.map(() => ({ count: 0 }));
       const snapshots = await Promise.all(
-        folders.map((folder) =>
+        folders.map((folder, index) =>
           this.scanWorkspaceFolderWithConfiguredBackend(
             folder,
             configuration,
-            acceptEntries,
-            () => requestedGeneration === this.generation && !limitReached,
+            (entries) =>
+              acceptEntries(entries, fairShares[index], workspaceAccepted[index]),
+            () =>
+              requestedGeneration === this.generation &&
+              !limitReached &&
+              workspaceAccepted[index].count < fairShares[index],
           ),
         ),
       );
+
+      // Every root gets a fair first-pass share. If a small root does not use its
+      // reservation, rescan roots that reached their share and reclaim the spare
+      // capacity without allowing the fastest root to starve the others.
+      if (maxEntries > 0 && acceptedEntryCount < maxEntries) {
+        for (let index = 0; index < folders.length && acceptedEntryCount < maxEntries; index += 1) {
+          if (workspaceAccepted[index].count < fairShares[index]) {
+            continue;
+          }
+          const snapshot = await this.scanWorkspaceFolderWithConfiguredBackend(
+            folders[index],
+            configuration,
+            (entries) => acceptEntries(entries),
+            () => requestedGeneration === this.generation && !limitReached,
+          );
+          snapshots[index] = {
+            errors: [...snapshots[index].errors, ...snapshot.errors],
+            partial: snapshots[index].partial || snapshot.partial,
+          };
+        }
+      }
 
       if (requestedGeneration !== this.generation) {
         return;
@@ -308,36 +406,26 @@ export class PathIndex implements vscode.Disposable {
     const workspaceName = workspaceFolder.name;
     const workspaceUri = workspaceFolder.uri.toString();
     const normalizedWorkspaceName = normalizeSearchText(workspaceName);
-    let directories: PendingDirectory[] = [
-      { uri: workspaceFolder.uri, relativePath: '', normalizedPath: '' },
-    ];
-
-    while (directories.length > 0 && shouldContinue()) {
-      const currentLevel = directories;
-      const nextLevel: PendingDirectory[] = [];
-      let nextDirectoryIndex = 0;
-
-      const scanNextDirectory = async (): Promise<void> => {
-        while (shouldContinue()) {
-          const directory = currentLevel[nextDirectoryIndex];
-          nextDirectoryIndex += 1;
-          if (!directory) {
-            return;
-          }
-
+    await scanDirectoryWorkQueue(
+      [{ uri: workspaceFolder.uri, relativePath: '', normalizedPath: '', depth: 0 }],
+      concurrency,
+      shouldContinue,
+      (directory) => priorityDirectories.has(directory.normalizedPath),
+      async (directory) => {
           let children: [string, vscode.FileType][];
           try {
             children = await vscode.workspace.fs.readDirectory(directory.uri);
           } catch (error) {
             errors.push(`${directory.uri.toString()}: ${String(error)}`);
-            continue;
+            return [];
           }
 
           if (!shouldContinue()) {
-            return;
+            return [];
           }
 
           const discoveredEntries: PathEntry[] = [];
+          const childDirectories: PendingDirectory[] = [];
           for (const [name, fileType] of children) {
             const normalizedName = normalizeSearchText(name);
             const relativePath = directory.relativePath
@@ -364,9 +452,14 @@ export class PathIndex implements vscode.Disposable {
                 normalizedPath,
                 normalizedWorkspaceName,
               }));
-              const pathDepth = relativePath.split('/').length;
+              const pathDepth = directory.depth + 1;
               if (!isSymbolicLink && (initialDepth === 0 || pathDepth < initialDepth)) {
-                nextLevel.push({ uri, relativePath, normalizedPath });
+                childDirectories.push({
+                  uri,
+                  relativePath,
+                  normalizedPath,
+                  depth: pathDepth,
+                });
               } else if (!isSymbolicLink && initialDepth > 0) {
                 partial = true;
               }
@@ -391,20 +484,9 @@ export class PathIndex implements vscode.Disposable {
           if (discoveredEntries.length > 0) {
             onEntries(discoveredEntries);
           }
-        }
-      };
-
-      const workerCount = Math.min(concurrency, currentLevel.length);
-      await Promise.all(Array.from({ length: workerCount }, () => scanNextDirectory()));
-      const prioritized: PendingDirectory[] = [];
-      const remaining: PendingDirectory[] = [];
-      for (const directory of nextLevel) {
-        (priorityDirectories.has(directory.normalizedPath) ? prioritized : remaining).push(
-          directory,
-        );
-      }
-      directories = [...prioritized, ...remaining];
-    }
+          return childDirectories;
+      },
+    );
 
     return { errors, partial };
   }
@@ -563,26 +645,18 @@ export class PathIndex implements vscode.Disposable {
     );
     const catalog = this.searchCatalog;
     const catalogRevision = catalog.revision;
-    const activeEntries = catalog.activeEntriesSnapshot();
-    const entries: Array<{
+    const entries = (function* (): IterableIterator<{
       workspaceIndex: number;
       kind: PathEntry['kind'];
       relativePath: string;
-    }> = [];
-    for (let index = 0; index < activeEntries.length; index += 1) {
-      const entry = activeEntries[index];
-      const workspaceIndex = workspaceIndexByUri.get(entry.workspaceUri);
-      if (workspaceIndex !== undefined) {
-        entries.push({ workspaceIndex, kind: entry.kind, relativePath: entry.relativePath });
+    }> {
+      for (const entry of catalog.activeEntries()) {
+        const workspaceIndex = workspaceIndexByUri.get(entry.workspaceUri);
+        if (workspaceIndex !== undefined) {
+          yield { workspaceIndex, kind: entry.kind, relativePath: entry.relativePath };
+        }
       }
-      if (index > 0 && index % CACHE_RESTORE_BATCH_SIZE === 0) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
-    }
-    if (this.searchCatalog !== catalog || catalog.revision !== catalogRevision) {
-      this.scheduleCacheSave();
-      return;
-    }
+    })();
     await this.persistence.save({
       createdAt: Date.now(),
       fingerprint: this.cacheFingerprint(configuration),
@@ -594,6 +668,9 @@ export class PathIndex implements vscode.Disposable {
       })),
       entries,
     });
+    if (this.searchCatalog !== catalog || catalog.revision !== catalogRevision) {
+      this.scheduleCacheSave();
+    }
   }
 
   private async indexScope(
@@ -640,6 +717,7 @@ export class PathIndex implements vscode.Disposable {
               uri: directoryUri,
               relativePath: normalizedScope,
               normalizedPath: normalizeSearchText(normalizedScope),
+              depth: normalizedScope ? normalizedScope.split('/').length : 0,
             },
             { ...configuration, initialIndexDepth: 0 },
           )) || changed;
@@ -857,6 +935,7 @@ export class PathIndex implements vscode.Disposable {
             uri,
             relativePath,
             normalizedPath: normalizeSearchText(relativePath),
+            depth: relativePath.split('/').length,
           },
           configuration,
         )) || added;
@@ -869,26 +948,21 @@ export class PathIndex implements vscode.Disposable {
     initialDirectory: PendingDirectory,
     configuration: IndexConfiguration,
   ): Promise<boolean> {
-    let directories = [initialDirectory];
     let added = false;
-    while (directories.length > 0 && !this.limitReached(configuration.maxEntries)) {
-      const currentLevel = directories;
-      const nextLevel: PendingDirectory[] = [];
-      let nextDirectoryIndex = 0;
-      const scanNextDirectory = async (): Promise<void> => {
-        while (!this.limitReached(configuration.maxEntries)) {
-          const directory = currentLevel[nextDirectoryIndex];
-          nextDirectoryIndex += 1;
-          if (!directory) {
-            return;
-          }
+    await scanDirectoryWorkQueue(
+      [initialDirectory],
+      configuration.indexConcurrency,
+      () => !this.limitReached(configuration.maxEntries),
+      () => false,
+      async (directory) => {
           let children: [string, vscode.FileType][];
           try {
             children = await vscode.workspace.fs.readDirectory(directory.uri);
           } catch {
-            continue;
+            return [];
           }
           const discoveredEntries: PathEntry[] = [];
+          const childDirectories: PendingDirectory[] = [];
           for (const [name, fileType] of children) {
             const normalizedName = normalizeSearchText(name);
             const relativePath = `${directory.relativePath}/${name}`;
@@ -904,7 +978,12 @@ export class PathIndex implements vscode.Disposable {
                 this.createEntry(workspaceFolder, relativePath, 'directory'),
               );
               if (!isSymbolicLink) {
-                nextLevel.push({ uri: childUri, relativePath, normalizedPath });
+                childDirectories.push({
+                  uri: childUri,
+                  relativePath,
+                  normalizedPath,
+                  depth: directory.depth + 1,
+                });
               }
             } else if (
               !hasExcludedFileExtension(
@@ -920,12 +999,9 @@ export class PathIndex implements vscode.Disposable {
           if (this.addLiveEntries(discoveredEntries, configuration.maxEntries) > 0) {
             added = true;
           }
-        }
-      };
-      const workerCount = Math.min(configuration.indexConcurrency, currentLevel.length);
-      await Promise.all(Array.from({ length: workerCount }, () => scanNextDirectory()));
-      directories = nextLevel;
-    }
+          return childDirectories;
+      },
+    );
     return added;
   }
 
