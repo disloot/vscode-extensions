@@ -205,6 +205,71 @@ test('path segment candidates support one- and two-character segment prefixes', 
   assert.deepEqual(matches, ['src/components/Button.tsx']);
 });
 
+test('catalog resolves a unique directory from a nested path suffix', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('abc/bcd', 'directory'),
+    entry('abc/bcd/cde', 'directory'),
+    entry('abc/bcd/cde/file.ts'),
+  ]);
+
+  assert.equal(
+    catalog.resolveUniqueDirectorySuffix('bcd/cde').relativePath,
+    'abc/bcd/cde',
+  );
+  assert.equal(
+    catalog.resolveUniqueDirectorySuffix('abc/bcd').relativePath,
+    'abc/bcd',
+  );
+});
+
+test('catalog does not auto-resolve an ambiguous directory suffix', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('abc/bcd/cde', 'directory'),
+    entry('other/bcd/cde', 'directory'),
+  ]);
+
+  assert.equal(catalog.resolveUniqueDirectorySuffix('bcd/cde'), undefined);
+});
+
+test('catalog prefers an exact directory path over additional suffix matches', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('abc/bcd', 'directory'),
+    entry('nested/abc/bcd', 'directory'),
+  ]);
+
+  assert.equal(catalog.resolveUniqueDirectorySuffix('abc/bcd').relativePath, 'abc/bcd');
+});
+
+test('directory suffix resolution cache is invalidated by catalog changes', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([entry('abc/bcd/cde', 'directory')]);
+  assert.equal(
+    catalog.resolveUniqueDirectorySuffix('bcd/cde').relativePath,
+    'abc/bcd/cde',
+  );
+
+  catalog.addEntries([entry('other/bcd/cde', 'directory')]);
+  assert.equal(catalog.resolveUniqueDirectorySuffix('bcd/cde'), undefined);
+  catalog.removePath('file:///workspace', 'other/bcd/cde');
+  assert.equal(
+    catalog.resolveUniqueDirectorySuffix('bcd/cde').relativePath,
+    'abc/bcd/cde',
+  );
+});
+
+test('directory suffix resolution stops safely at its synchronous candidate limit', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    ...Array.from({ length: 2_001 }, (_, index) => entry(`files-${index}/cde`)),
+    entry('abc/bcd/cde', 'directory'),
+  ]);
+
+  assert.equal(catalog.resolveUniqueDirectorySuffix('bcd/cde'), undefined);
+});
+
 test('partition replacement is atomic and leaves other workspaces searchable', () => {
   const catalog = new PartitionedPathSearchCatalog();
   const alpha = new PathSearchCatalog();
@@ -224,4 +289,25 @@ test('partition replacement is atomic and leaves other workspaces searchable', (
   assert.equal(catalog.getEntryByPath('file:///alpha', 'src/new.ts').name, 'new.ts');
   assert.equal(catalog.getEntryByPath('file:///beta', 'src/stable.ts').name, 'stable.ts');
   assert.equal([...catalog.workspaceCandidateIds()].length, 2);
+});
+
+test('partitioned catalog resolves suffixes and preserves cross-workspace ambiguity', () => {
+  const catalog = new PartitionedPathSearchCatalog();
+  catalog.addEntries([
+    entry('abc/bcd/cde', 'directory', 'file:///alpha'),
+    entry('abc/bcd/cde/file.ts', 'file', 'file:///alpha'),
+  ]);
+
+  assert.equal(
+    catalog.resolveUniqueDirectorySuffix('bcd/cde').workspaceUri,
+    'file:///alpha',
+  );
+  catalog.addEntries([
+    entry('other/bcd/cde', 'directory', 'file:///beta'),
+  ]);
+  assert.equal(catalog.resolveUniqueDirectorySuffix('bcd/cde'), undefined);
+  assert.equal(
+    catalog.resolveUniqueDirectorySuffix('bcd/cde', 'file:///beta').relativePath,
+    'other/bcd/cde',
+  );
 });

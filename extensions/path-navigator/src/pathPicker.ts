@@ -100,9 +100,10 @@ export class PathPicker {
     let programmaticTargetIdentity: string | undefined;
     let currentVisibleEntries: readonly PathEntry[] = [];
     let currentScopePath = '';
+    let currentSearchQuery = '';
     let currentSearchTruncated = false;
     let reusableSearch: ReusableSearchState | undefined;
-    picker.placeholder = 'Search paths · // global path · Tab enter directory';
+    picker.placeholder = 'Search names or path chains · // global path · Tab enter directory';
     picker.title = 'Path Navigator';
     const updateFilterButtons = (): void => {
       fileFilterButton = {
@@ -309,9 +310,42 @@ export class PathPicker {
         resultUpdates.reset();
       }
       this.reconcileWorkspaceLock(picker.value);
-      const { scopePath, query, mode } = parsePathInput(picker.value);
-      void this.index.ensureScopeIndexed(this.workspaceLock?.workspaceUri, scopePath);
+      const parsedInput = parsePathInput(picker.value);
+      let { scopePath, query, mode } = parsedInput;
+      const catalog = this.index.currentSearchCatalog;
+      let workspaceUri = this.workspaceLock?.workspaceUri;
+      void this.index.ensureScopeIndexed(workspaceUri, parsedInput.scopePath);
+
+      if (mode === 'scoped' && parsedInput.scopePath) {
+        const pathQuery = parsedInput.query
+          ? `${parsedInput.scopePath}/${parsedInput.query}`
+          : parsedInput.scopePath;
+        const resolvedDirectory = pathQuery.includes('/')
+          ? catalog.resolveUniqueDirectorySuffix(pathQuery, workspaceUri)
+          : undefined;
+        if (resolvedDirectory) {
+          scopePath = resolvedDirectory.relativePath;
+          query = '';
+          workspaceUri ??= resolvedDirectory.workspaceUri;
+        } else {
+          const exactScopeExists = (vscode.workspace.workspaceFolders ?? []).some((folder) =>
+            (!workspaceUri || folder.uri.toString() === workspaceUri) &&
+            catalog.getEntryByPath(folder.uri.toString(), parsedInput.scopePath)?.kind ===
+              'directory',
+          );
+          if (!exactScopeExists) {
+            scopePath = '';
+            query = pathQuery;
+            mode = 'globalPath';
+          }
+        }
+      }
+
+      if (scopePath && scopePath !== parsedInput.scopePath) {
+        void this.index.ensureScopeIndexed(workspaceUri, scopePath);
+      }
       currentScopePath = scopePath;
+      currentSearchQuery = query;
       currentSearchTruncated = false;
       updateTitle();
 
@@ -327,9 +361,7 @@ export class PathPicker {
         'progressiveSearchResults',
         false,
       );
-      const catalog = this.index.currentSearchCatalog;
       const catalogRevision = catalog.revision;
-      const workspaceUri = this.workspaceLock?.workspaceUri;
       const recentPaths = this.recentPaths.getUsages(query);
       const normalizedScope = normalizeSearchText(scopePath).replace(/\/$/, '');
       const normalizedQuery = normalizeSearchQuery(query);
@@ -510,9 +542,8 @@ export class PathPicker {
           this.completeEntry(selected.entry, picker);
           return;
         }
-        const { query } = parsePathInput(picker.value);
         picker.hide();
-        void this.openEntry(selected.entry, query);
+        void this.openEntry(selected.entry, currentSearchQuery);
       }),
       picker.onDidTriggerButton((button) => {
         if (button === fileFilterButton) {

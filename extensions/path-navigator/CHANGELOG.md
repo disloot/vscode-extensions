@@ -1,5 +1,16 @@
 # Change Log
 
+## 2.1.0
+
+- Resolve a unique multi-segment directory input such as `bcd/cde` against any matching path
+  suffix and immediately show that directory's direct children.
+- Fall back to full-path candidate search when a typed directory prefix does not exist at the
+  current level, while keeping ambiguous suffix matches selectable.
+- Resolve path chains through exact-path lookups and exact terminal-directory postings instead
+  of scanning broad three-character path-prefix buckets.
+- Cache 128 recent path-chain resolutions per catalog revision and cap synchronous suffix
+  validation at 2,000 same-name candidates.
+
 ## 2.0.0
 
 - Store retained paths in compact string, kind, and workspace columns instead of one JavaScript

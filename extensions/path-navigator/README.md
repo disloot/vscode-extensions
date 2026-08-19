@@ -8,6 +8,8 @@ workspace-relative paths.
 - Search all descendant files and directories using partial or fuzzy names.
 - Prefix a query with `//` to fuzzy-search a complete path without entering a scope.
 - Press Tab to complete a directory and continue searching inside it.
+- Type a multi-segment chain such as `bcd/cde` to jump directly into a uniquely matching nested
+  directory even when its full path starts with another segment such as `abc/`.
 - Open files as pinned editor tabs by default.
 - Reveal and select directories in the built-in Explorer.
 - Index empty directories as well as files.
@@ -55,6 +57,13 @@ Global search and directory navigation work together. Given
 `abc/bcd/cde/file.ts`, typing `fi` or `ile` at the workspace root finds the file
 immediately. After completing `abc/` with Tab, the same search only returns
 matches located somewhere inside `abc/`.
+
+Multi-segment input also works as a directory-chain shortcut. If the workspace contains
+`abc/bcd/cde/file.ts`, entering `bcd/cde` uniquely resolves `abc/bcd/cde` and immediately shows
+the direct files and subdirectories under `cde`. If more than one directory ends in `bcd/cde`,
+Path Navigator keeps the matching paths in the candidate list instead of choosing one silently.
+Directory-chain resolution uses exact terminal-name postings, a bounded candidate check, and a
+small revision-aware cache so it remains responsive in very large workspaces.
 
 Prefix the input with `//` when slashes should be part of a global full-path query
 instead of an exact directory scope. For example, `//src/comp/button` can rank

@@ -5,6 +5,7 @@ import {
   type PathEntryKind,
   type PathWorkspaceMetadata,
 } from './pathEntry';
+import { LruCache } from './lruCache';
 import {
   normalizeSearchQuery,
   normalizeSearchText,
@@ -17,6 +18,8 @@ const MIN_PACKED_TAIL_MERGE_SIZE = 4_096;
 const COLUMN_CHUNK_SIZE = 16_384;
 const FILE_KIND = 0;
 const DIRECTORY_KIND = 1;
+const DIRECTORY_SUFFIX_CACHE_SIZE = 128;
+const DIRECTORY_SUFFIX_CANDIDATE_LIMIT = 2_000;
 
 interface PackedIdBucket {
   readonly packed: Uint32Array;
@@ -47,6 +50,10 @@ export interface PathSearchIndex {
     directChildrenOnly?: boolean,
   ): boolean;
   getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined;
+  resolveUniqueDirectorySuffix(
+    pathQuery: string,
+    workspaceUri?: string,
+  ): PathEntry | undefined;
   normalizedWorkspaceNameForEntry(entry: PathEntry): string;
   isWithinNormalizedScope(
     entry: PathEntry,
@@ -304,6 +311,9 @@ export class PathSearchCatalog implements PathSearchIndex {
   private readonly workspaceIds = new ChunkedUint16Column();
   private readonly workspaces = new Map<string, WorkspaceCatalog>();
   private readonly workspacesById: WorkspaceCatalog[] = [];
+  private readonly directorySuffixCache = new LruCache<string, PathEntry | null>(
+    DIRECTORY_SUFFIX_CACHE_SIZE,
+  );
   private activeEntryCount = 0;
   private removedEntryCount = 0;
   readonly instanceId = PathSearchCatalog.nextInstanceId++;
@@ -385,6 +395,7 @@ export class PathSearchCatalog implements PathSearchIndex {
     }
     if (addedCount > 0) {
       this.catalogRevision += 1;
+      this.directorySuffixCache.clear();
     }
     return addedCount;
   }
@@ -517,6 +528,64 @@ export class PathSearchCatalog implements PathSearchIndex {
     return entryId === undefined ? undefined : this.getEntryById(entryId);
   }
 
+  resolveUniqueDirectorySuffix(
+    pathQuery: string,
+    workspaceUri?: string,
+  ): PathEntry | undefined {
+    const normalizedQuery = normalizeSearchQuery(pathQuery).replace(/^\/+|\/+$/g, '');
+    if (!normalizedQuery.includes('/')) {
+      return undefined;
+    }
+    const cacheKey = `${this.catalogRevision}\0${workspaceUri ?? '*'}\0${normalizedQuery}`;
+    const cached = this.directorySuffixCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached ?? undefined;
+    }
+
+    let exactEntry: PathEntry | undefined;
+    for (const workspace of this.selectedWorkspaces(workspaceUri)) {
+      const candidate = this.getEntryByPath(workspace.uri, normalizedQuery);
+      if (candidate?.kind !== 'directory') {
+        continue;
+      }
+      if (exactEntry) {
+        this.directorySuffixCache.set(cacheKey, null);
+        return undefined;
+      }
+      exactEntry = candidate;
+    }
+    if (exactEntry) {
+      this.directorySuffixCache.set(cacheKey, exactEntry);
+      return exactEntry;
+    }
+
+    const terminalName = normalizedQuery.slice(normalizedQuery.lastIndexOf('/') + 1);
+    let suffixEntryId: PathEntryId | undefined;
+    let inspectedCandidates = 0;
+    for (const entryId of this.exactNameCandidateIds(terminalName, workspaceUri)) {
+      inspectedCandidates += 1;
+      if (inspectedCandidates > DIRECTORY_SUFFIX_CANDIDATE_LIMIT) {
+        this.directorySuffixCache.set(cacheKey, null);
+        return undefined;
+      }
+      if (this.entryKindById(entryId) !== 'directory') {
+        continue;
+      }
+      const normalizedPath = this.normalizedPaths[entryId];
+      if (!normalizedPath?.endsWith(`/${normalizedQuery}`)) {
+        continue;
+      }
+      if (suffixEntryId !== undefined && suffixEntryId !== entryId) {
+        this.directorySuffixCache.set(cacheKey, null);
+        return undefined;
+      }
+      suffixEntryId = entryId;
+    }
+    const resolved = suffixEntryId === undefined ? undefined : this.getEntryById(suffixEntryId);
+    this.directorySuffixCache.set(cacheKey, resolved ?? null);
+    return resolved;
+  }
+
   removePath(workspaceUri: string, relativePath: string, recursive = true): number {
     const workspace = this.workspaces.get(workspaceUri);
     if (!workspace) {
@@ -557,6 +626,7 @@ export class PathSearchCatalog implements PathSearchIndex {
     }
     if (idsToRemove.length > 0) {
       this.catalogRevision += 1;
+      this.directorySuffixCache.clear();
     }
     return idsToRemove.length;
   }
@@ -897,6 +967,9 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
   private readonly partitionsById = new Map<number, PathSearchCatalog>();
   private nextPartitionId = 1;
   private catalogRevision = 0;
+  private readonly directorySuffixCache = new LruCache<string, PathEntry | null>(
+    DIRECTORY_SUFFIX_CACHE_SIZE,
+  );
   readonly instanceId = PartitionedPathSearchCatalog.nextInstanceId++;
 
   get size(): number {
@@ -932,6 +1005,7 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
     this.partitionsByUri.set(workspaceUri, { partitionId, catalog });
     this.partitionsById.set(partitionId, catalog);
     this.catalogRevision += 1;
+    this.directorySuffixCache.clear();
   }
 
   removeWorkspace(workspaceUri: string): void {
@@ -942,6 +1016,7 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
     this.partitionsByUri.delete(workspaceUri);
     this.partitionsById.delete(existing.partitionId);
     this.catalogRevision += 1;
+    this.directorySuffixCache.clear();
   }
 
   workspaceCatalog(workspaceUri: string): PathSearchCatalog | undefined {
@@ -964,6 +1039,7 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
 
   markWorkspaceChanged(): void {
     this.catalogRevision += 1;
+    this.directorySuffixCache.clear();
   }
 
   compactWorkspace(workspaceUri: string): void {
@@ -998,6 +1074,7 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
     }
     if (added > 0) {
       this.catalogRevision += 1;
+      this.directorySuffixCache.clear();
     }
     return added;
   }
@@ -1007,6 +1084,7 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
       ?.removePath(workspaceUri, relativePath, recursive) ?? 0;
     if (removed > 0) {
       this.catalogRevision += 1;
+      this.directorySuffixCache.clear();
     }
     return removed;
   }
@@ -1071,6 +1149,71 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
 
   getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined {
     return this.workspaceCatalog(workspaceUri)?.getEntryByPath(workspaceUri, relativePath);
+  }
+
+  resolveUniqueDirectorySuffix(
+    pathQuery: string,
+    workspaceUri?: string,
+  ): PathEntry | undefined {
+    const normalizedQuery = normalizeSearchQuery(pathQuery).replace(/^\/+|\/+$/g, '');
+    if (!normalizedQuery.includes('/')) {
+      return undefined;
+    }
+    const cacheKey = `${this.catalogRevision}\0${workspaceUri ?? '*'}\0${normalizedQuery}`;
+    const cached = this.directorySuffixCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached ?? undefined;
+    }
+
+    let exactEntry: PathEntry | undefined;
+    const exactPartitions = workspaceUri
+      ? [[workspaceUri, this.partitionsByUri.get(workspaceUri)] as const]
+      : this.partitionsByUri.entries();
+    for (const [partitionWorkspaceUri, partition] of exactPartitions) {
+      const candidate = partition?.catalog.getEntryByPath(
+        partitionWorkspaceUri,
+        normalizedQuery,
+      );
+      if (candidate?.kind !== 'directory') {
+        continue;
+      }
+      if (exactEntry) {
+        this.directorySuffixCache.set(cacheKey, null);
+        return undefined;
+      }
+      exactEntry = candidate;
+    }
+    if (exactEntry) {
+      this.directorySuffixCache.set(cacheKey, exactEntry);
+      return exactEntry;
+    }
+
+    const terminalName = normalizedQuery.slice(normalizedQuery.lastIndexOf('/') + 1);
+    let suffixEntryId: PathEntryId | undefined;
+    let inspectedCandidates = 0;
+    for (const entryId of this.exactNameCandidateIds(terminalName, workspaceUri)) {
+      inspectedCandidates += 1;
+      if (inspectedCandidates > DIRECTORY_SUFFIX_CANDIDATE_LIMIT) {
+        this.directorySuffixCache.set(cacheKey, null);
+        return undefined;
+      }
+      if (this.entryKindById(entryId) !== 'directory') {
+        continue;
+      }
+      const relativePath = this.entryRelativePathById(entryId);
+      const normalizedPath = relativePath && normalizeSearchText(relativePath);
+      if (!normalizedPath?.endsWith(`/${normalizedQuery}`)) {
+        continue;
+      }
+      if (suffixEntryId !== undefined && suffixEntryId !== entryId) {
+        this.directorySuffixCache.set(cacheKey, null);
+        return undefined;
+      }
+      suffixEntryId = entryId;
+    }
+    const resolved = suffixEntryId === undefined ? undefined : this.getEntryById(suffixEntryId);
+    this.directorySuffixCache.set(cacheKey, resolved ?? null);
+    return resolved;
   }
 
   normalizedWorkspaceNameForEntry(entry: PathEntry): string {

@@ -307,6 +307,36 @@ test('global path mode retrieves by the final segment and ranks by the complete 
   assert.equal(progress.at(-1).entries[0].relativePath, target.relativePath);
 });
 
+test('a resolved directory path chain shows only its direct children', async () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('abc/bcd/cde', 'directory'),
+    entry('abc/bcd/cde/file.ts'),
+    entry('abc/bcd/cde/nested', 'directory'),
+    entry('abc/bcd/cde/nested/deep.ts'),
+    entry('other.ts'),
+  ]);
+  const resolved = catalog.resolveUniqueDirectorySuffix('bcd/cde');
+  const progress = [];
+  await searchPaths({
+    catalog,
+    scopePath: resolved.relativePath,
+    query: '',
+    maxResults: 50,
+    maxCandidates: 10_000,
+    timeBudgetMs: 1_000,
+    recentPaths: [],
+    allowUnindexedRecentPaths: false,
+    isCancelled: () => false,
+    onProgress: (value) => progress.push(value),
+  });
+
+  assert.deepEqual(progress.at(-1).entries.map(({ relativePath }) => relativePath), [
+    'abc/bcd/cde/nested',
+    'abc/bcd/cde/file.ts',
+  ]);
+});
+
 test('pinned paths receive a stable ranking boost', async () => {
   const pinned = entry('deep/file-b.ts');
   const progress = await search([entry('file-a.ts'), pinned], {
