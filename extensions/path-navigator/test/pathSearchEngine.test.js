@@ -129,6 +129,21 @@ test('recent and frequently opened paths receive a bounded ranking boost', async
   assert.equal(progress.at(-1).entries[0].relativePath, 'src/file-b.ts');
 });
 
+test('indexed recent paths remain isolated to the requested workspace', async () => {
+  const alpha = entry('src/main.ts', 'file', 'file:///alpha');
+  const beta = entry('src/main.ts', 'file', 'file:///beta');
+  const progress = await search([alpha, beta], {
+    query: 'main',
+    workspaceUri: 'file:///beta',
+    recentPaths: [{ entry: alpha, lastOpenedAt: 1_000, openCount: 20 }],
+    now: 1_000,
+  });
+
+  assert.deepEqual(progress.at(-1).entries.map(({ workspaceUri }) => workspaceUri), [
+    'file:///beta',
+  ]);
+});
+
 test('query history can promote the result previously selected for that query', async () => {
   const preferred = entry('deep/file-b.ts');
   const progress = await search([entry('file-a.ts'), preferred], {

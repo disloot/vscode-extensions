@@ -1,5 +1,16 @@
 # Change Log
 
+## 2.0.0
+
+- Store retained paths in compact string, kind, and workspace columns instead of one JavaScript
+  object per indexed file or directory.
+- Share workspace metadata once per catalog and materialize `PathEntry` objects only for visible
+  Top-K results, persistence batches, and direct lookups.
+- Score, filter, and scope numeric candidates directly from columns during bounded searches.
+- Rebuild tombstoned workspace partitions in 5,000-entry batches to avoid a full materialized
+  snapshot during compaction.
+- Report retained heap and typed-array memory separately in the large-index benchmark.
+
 ## 1.1.0
 
 - Persist every workspace-root partition in an independent v5 streamed cache file.

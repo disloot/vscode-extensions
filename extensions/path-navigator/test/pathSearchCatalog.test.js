@@ -151,6 +151,35 @@ test('numeric candidate APIs preserve the same candidate membership', () => {
   assert.equal(catalog.capacity, 3);
 });
 
+test('columnar catalog materializes entries on demand without retaining object identity', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([entry('src/main.py')]);
+  const entryId = catalog.getEntryId('file:///workspace\0file\0src/main.py');
+  const first = catalog.getEntryById(entryId);
+  const second = catalog.getEntryById(entryId);
+
+  assert.notStrictEqual(first, second);
+  assert.deepEqual(
+    {
+      kind: second.kind,
+      name: second.name,
+      relativePath: second.relativePath,
+      workspaceName: second.workspaceName,
+      workspaceUri: second.workspaceUri,
+    },
+    {
+      kind: 'file',
+      name: 'main.py',
+      relativePath: 'src/main.py',
+      workspaceName: 'workspace',
+      workspaceUri: 'file:///workspace',
+    },
+  );
+  assert.equal(catalog.entryKindById(entryId), 'file');
+  assert.equal(catalog.entryRelativePathById(entryId), 'src/main.py');
+  assert.ok(catalog.scoreEntryById(entryId, 'main.py') > 0);
+});
+
 test('path segment candidates intersect compact prefixes across a complete path', () => {
   const catalog = new PathSearchCatalog();
   catalog.addEntries([

@@ -113,12 +113,31 @@ export function scorePathWithNormalizedQuery(
   fuzzyMatching = true,
   normalizedWorkspaceName?: string,
 ): number | undefined {
-  if (!query) {
-    return item.kind === 'directory' ? 10 : 0;
-  }
-
   const path = item.normalizedPath ?? normalizeSearchText(item.relativePath);
-  const name = item.normalizedName ?? path.slice(path.lastIndexOf('/') + 1);
+  return scorePathValuesWithNormalizedQuery(
+    item.kind,
+    path,
+    item.normalizedName ?? path.slice(path.lastIndexOf('/') + 1),
+    normalizedWorkspaceName ??
+      item.normalizedWorkspaceName ??
+      normalizeSearchText(item.workspaceName),
+    query,
+    fuzzyMatching,
+  );
+}
+
+/** Scores retained index columns without materializing a PathEntry object. */
+export function scorePathValuesWithNormalizedQuery(
+  kind: SearchablePath['kind'],
+  path: string,
+  name: string,
+  workspace: string,
+  query: string,
+  fuzzyMatching = true,
+): number | undefined {
+  if (!query) {
+    return kind === 'directory' ? 10 : 0;
+  }
 
   if (path === query) {
     return 10_000;
@@ -143,10 +162,6 @@ export function scorePathWithNormalizedQuery(
     return 7_000 - pathIndex - path.length * 0.1;
   }
 
-  const workspace =
-    normalizedWorkspaceName ??
-    item.normalizedWorkspaceName ??
-    normalizeSearchText(item.workspaceName);
   const searchablePath = `${workspace}/${path}`;
   if (searchablePath === query) {
     return 10_000;

@@ -1,9 +1,22 @@
-import type { PathEntry } from './pathEntry';
-import { normalizeSearchQuery, normalizeSearchText } from './search';
+import {
+  createCompactPathEntry,
+  createPathWorkspaceMetadata,
+  type PathEntry,
+  type PathEntryKind,
+  type PathWorkspaceMetadata,
+} from './pathEntry';
+import {
+  normalizeSearchQuery,
+  normalizeSearchText,
+  scorePathValuesWithNormalizedQuery,
+} from './search';
 
 const PACK_BUCKET_THRESHOLD = 32;
 const NGRAM_INTERSECTION_BUCKETS = 3;
 const MIN_PACKED_TAIL_MERGE_SIZE = 4_096;
+const COLUMN_CHUNK_SIZE = 16_384;
+const FILE_KIND = 0;
+const DIRECTORY_KIND = 1;
 
 interface PackedIdBucket {
   readonly packed: Uint32Array;
@@ -21,6 +34,18 @@ export interface PathSearchIndex {
   getEntry(identity: string): PathEntry | undefined;
   getEntryId(identity: string): PathEntryId | undefined;
   getEntryById(entryId: PathEntryId): PathEntry | undefined;
+  entryKindById(entryId: PathEntryId): PathEntryKind | undefined;
+  entryRelativePathById(entryId: PathEntryId): string | undefined;
+  scoreEntryById(
+    entryId: PathEntryId,
+    normalizedQuery: string,
+    fuzzyMatching?: boolean,
+  ): number | undefined;
+  isEntryIdWithinNormalizedScope(
+    entryId: PathEntryId,
+    normalizedScope: string,
+    directChildrenOnly?: boolean,
+  ): boolean;
   getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined;
   normalizedWorkspaceNameForEntry(entry: PathEntry): string;
   isWithinNormalizedScope(
@@ -39,8 +64,11 @@ export interface PathSearchIndex {
 }
 
 interface WorkspaceCatalog {
+  readonly id: number;
+  readonly name: string;
   readonly uri: string;
   readonly normalizedWorkspaceName: string;
+  readonly metadata: PathWorkspaceMetadata;
   entryIds: IdBucket | undefined;
   readonly idsByNormalizedPath: BucketMap;
   readonly childrenByParent: BucketMap;
@@ -48,6 +76,49 @@ interface WorkspaceCatalog {
   readonly entriesByNamePrefix: BucketMap;
   readonly entriesByBigram: BucketMap;
   readonly entriesBySegmentPrefix: BucketMap;
+}
+
+class ChunkedUint8Column {
+  private readonly chunks: Uint8Array[] = [];
+  length = 0;
+
+  push(value: number): void {
+    const chunkIndex = Math.floor(this.length / COLUMN_CHUNK_SIZE);
+    if (chunkIndex === this.chunks.length) {
+      this.chunks.push(new Uint8Array(COLUMN_CHUNK_SIZE));
+    }
+    this.chunks[chunkIndex][this.length % COLUMN_CHUNK_SIZE] = value;
+    this.length += 1;
+  }
+
+  get(index: number): number | undefined {
+    return index < 0 || index >= this.length
+      ? undefined
+      : this.chunks[Math.floor(index / COLUMN_CHUNK_SIZE)][index % COLUMN_CHUNK_SIZE];
+  }
+}
+
+class ChunkedUint16Column {
+  private readonly chunks: Uint16Array[] = [];
+  length = 0;
+
+  push(value: number): void {
+    if (value > 0xffff) {
+      throw new Error('Path Navigator supports at most 65,536 workspace columns.');
+    }
+    const chunkIndex = Math.floor(this.length / COLUMN_CHUNK_SIZE);
+    if (chunkIndex === this.chunks.length) {
+      this.chunks.push(new Uint16Array(COLUMN_CHUNK_SIZE));
+    }
+    this.chunks[chunkIndex][this.length % COLUMN_CHUNK_SIZE] = value;
+    this.length += 1;
+  }
+
+  get(index: number): number | undefined {
+    return index < 0 || index >= this.length
+      ? undefined
+      : this.chunks[Math.floor(index / COLUMN_CHUNK_SIZE)][index % COLUMN_CHUNK_SIZE];
+  }
 }
 
 function appendId(bucket: IdBucket | undefined, entryId: number): IdBucket {
@@ -191,10 +262,30 @@ function uniqueSegmentPrefixes(value: string): Set<string> {
   return prefixes;
 }
 
-function createWorkspaceCatalog(uri: string, normalizedWorkspaceName: string): WorkspaceCatalog {
+function isNormalizedPathWithinScope(
+  normalizedPath: string,
+  normalizedScope: string,
+  directChildrenOnly: boolean,
+): boolean {
+  if (directChildrenOnly) {
+    const separatorIndex = normalizedPath.lastIndexOf('/');
+    return (separatorIndex < 0 ? '' : normalizedPath.slice(0, separatorIndex)) === normalizedScope;
+  }
+  return normalizedScope.length === 0 || normalizedPath.startsWith(`${normalizedScope}/`);
+}
+
+function createWorkspaceCatalog(
+  id: number,
+  name: string,
+  uri: string,
+  normalizedWorkspaceName: string,
+): WorkspaceCatalog {
   return {
+    id,
+    name,
     uri,
     normalizedWorkspaceName,
+    metadata: createPathWorkspaceMetadata(name, uri),
     entryIds: undefined,
     idsByNormalizedPath: new Map(),
     childrenByParent: new Map(),
@@ -207,8 +298,12 @@ function createWorkspaceCatalog(uri: string, normalizedWorkspaceName: string): W
 
 export class PathSearchCatalog implements PathSearchIndex {
   private static nextInstanceId = 1;
-  private readonly entries: Array<PathEntry | undefined> = [];
+  private readonly relativePaths: Array<string | undefined> = [];
+  private readonly normalizedPaths: Array<string | undefined> = [];
+  private readonly kinds = new ChunkedUint8Column();
+  private readonly workspaceIds = new ChunkedUint16Column();
   private readonly workspaces = new Map<string, WorkspaceCatalog>();
+  private readonly workspacesById: WorkspaceCatalog[] = [];
   private activeEntryCount = 0;
   private removedEntryCount = 0;
   readonly instanceId = PathSearchCatalog.nextInstanceId++;
@@ -219,7 +314,7 @@ export class PathSearchCatalog implements PathSearchIndex {
   }
 
   get capacity(): number {
-    return this.entries.length;
+    return this.relativePaths.length;
   }
 
   get revision(): number {
@@ -227,7 +322,9 @@ export class PathSearchCatalog implements PathSearchIndex {
   }
 
   get tombstoneRatio(): number {
-    return this.entries.length === 0 ? 0 : this.removedEntryCount / this.entries.length;
+    return this.relativePaths.length === 0
+      ? 0
+      : this.removedEntryCount / this.relativePaths.length;
   }
 
   addEntries(entries: readonly PathEntry[]): number {
@@ -241,7 +338,7 @@ export class PathSearchCatalog implements PathSearchIndex {
         continue;
       }
 
-      const entryId = this.entries.length;
+      const entryId = this.relativePaths.length;
       const normalizedPath = entry.normalizedPath ?? normalizeSearchText(entry.relativePath);
       const normalizedName = entry.normalizedName ?? normalizeSearchText(entry.name);
       const separatorIndex = normalizedPath.lastIndexOf('/');
@@ -250,13 +347,19 @@ export class PathSearchCatalog implements PathSearchIndex {
       let workspace = this.workspaces.get(entry.workspaceUri);
       if (!workspace) {
         workspace = createWorkspaceCatalog(
+          this.workspacesById.length,
+          entry.workspaceName,
           entry.workspaceUri,
           entry.normalizedWorkspaceName ?? normalizeSearchText(entry.workspaceName),
         );
         this.workspaces.set(entry.workspaceUri, workspace);
+        this.workspacesById.push(workspace);
       }
 
-      this.entries.push(entry);
+      this.relativePaths.push(entry.relativePath);
+      this.normalizedPaths.push(normalizedPath);
+      this.kinds.push(entry.kind === 'directory' ? DIRECTORY_KIND : FILE_KIND);
+      this.workspaceIds.push(workspace.id);
       this.activeEntryCount += 1;
       addedCount += 1;
       workspace.entryIds = appendId(workspace.entryIds, entryId);
@@ -300,7 +403,7 @@ export class PathSearchCatalog implements PathSearchIndex {
 
   getEntry(identity: string): PathEntry | undefined {
     const entryId = this.getEntryId(identity);
-    return entryId === undefined ? undefined : this.entries[entryId];
+    return entryId === undefined ? undefined : this.getEntryById(entryId);
   }
 
   getEntryId(identity: string): PathEntryId | undefined {
@@ -319,12 +422,85 @@ export class PathSearchCatalog implements PathSearchIndex {
       workspace,
       identity.slice(kindSeparator + 1),
     );
-    const entry = entryId === undefined ? undefined : this.entries[entryId];
-    return entry?.kind === kind ? entryId : undefined;
+    return entryId !== undefined && this.entryKindById(entryId) === kind
+      ? entryId
+      : undefined;
   }
 
   getEntryById(entryId: PathEntryId): PathEntry | undefined {
-    return this.entries[entryId];
+    const relativePath = this.relativePaths[entryId];
+    const normalizedPath = this.normalizedPaths[entryId];
+    const workspaceId = this.workspaceIds.get(entryId);
+    const kind = this.entryKindById(entryId);
+    if (
+      relativePath === undefined ||
+      normalizedPath === undefined ||
+      workspaceId === undefined ||
+      kind === undefined
+    ) {
+      return undefined;
+    }
+    const workspace = this.workspacesById[workspaceId];
+    if (!workspace) {
+      return undefined;
+    }
+    const separatorIndex = relativePath.lastIndexOf('/');
+    return createCompactPathEntry({
+      kind,
+      name: relativePath.slice(separatorIndex + 1),
+      relativePath,
+      workspaceName: workspace.name,
+      workspaceUri: workspace.uri,
+      normalizedPath,
+    }, workspace.metadata);
+  }
+
+  entryKindById(entryId: PathEntryId): PathEntryKind | undefined {
+    if (!this.isActive(entryId)) {
+      return undefined;
+    }
+    return this.kinds.get(entryId) === DIRECTORY_KIND ? 'directory' : 'file';
+  }
+
+  entryRelativePathById(entryId: PathEntryId): string | undefined {
+    return this.relativePaths[entryId];
+  }
+
+  scoreEntryById(
+    entryId: PathEntryId,
+    normalizedQuery: string,
+    fuzzyMatching = true,
+  ): number | undefined {
+    const normalizedPath = this.normalizedPaths[entryId];
+    const workspaceId = this.workspaceIds.get(entryId);
+    const kind = this.entryKindById(entryId);
+    if (normalizedPath === undefined || workspaceId === undefined || kind === undefined) {
+      return undefined;
+    }
+    const workspace = this.workspacesById[workspaceId];
+    if (!workspace) {
+      return undefined;
+    }
+    return scorePathValuesWithNormalizedQuery(
+      kind,
+      normalizedPath,
+      normalizedPath.slice(normalizedPath.lastIndexOf('/') + 1),
+      workspace.normalizedWorkspaceName,
+      normalizedQuery,
+      fuzzyMatching,
+    );
+  }
+
+  isEntryIdWithinNormalizedScope(
+    entryId: PathEntryId,
+    normalizedScope: string,
+    directChildrenOnly = false,
+  ): boolean {
+    const normalizedPath = this.normalizedPaths[entryId];
+    if (normalizedPath === undefined) {
+      return false;
+    }
+    return isNormalizedPathWithinScope(normalizedPath, normalizedScope, directChildrenOnly);
   }
 
   normalizedWorkspaceNameForEntry(entry: PathEntry): string {
@@ -338,7 +514,7 @@ export class PathSearchCatalog implements PathSearchIndex {
       return undefined;
     }
     const entryId = this.findPathEntryId(workspace, relativePath);
-    return entryId === undefined ? undefined : this.entries[entryId];
+    return entryId === undefined ? undefined : this.getEntryById(entryId);
   }
 
   removePath(workspaceUri: string, relativePath: string, recursive = true): number {
@@ -355,17 +531,15 @@ export class PathSearchCatalog implements PathSearchIndex {
     const idsToRemove: number[] = [];
     for (let index = 0; index < pendingIds.length; index += 1) {
       const entryId = pendingIds[index];
-      const entry = this.entries[entryId];
-      if (!entry) {
+      const normalizedPath = this.normalizedPaths[entryId];
+      if (normalizedPath === undefined) {
         continue;
       }
       idsToRemove.push(entryId);
-      if (recursive && entry.kind === 'directory') {
-        const childIds = workspace.childrenByParent.get(
-          entry.normalizedPath ?? normalizeSearchText(entry.relativePath),
-        );
+      if (recursive && this.entryKindById(entryId) === 'directory') {
+        const childIds = workspace.childrenByParent.get(normalizedPath);
         for (const childId of bucketIds(childIds)) {
-          if (this.entries[childId]) {
+          if (this.isActive(childId)) {
             pendingIds.push(childId);
           }
         }
@@ -373,11 +547,11 @@ export class PathSearchCatalog implements PathSearchIndex {
     }
 
     for (const entryId of idsToRemove) {
-      const entry = this.entries[entryId];
-      if (!entry) {
+      if (!this.isActive(entryId)) {
         continue;
       }
-      this.entries[entryId] = undefined;
+      this.relativePaths[entryId] = undefined;
+      this.normalizedPaths[entryId] = undefined;
       this.activeEntryCount -= 1;
       this.removedEntryCount += 1;
     }
@@ -398,14 +572,7 @@ export class PathSearchCatalog implements PathSearchIndex {
     directChildrenOnly = false,
   ): boolean {
     const normalizedPath = entry.normalizedPath ?? normalizeSearchText(entry.relativePath);
-    const separatorIndex = normalizedPath.lastIndexOf('/');
-    const normalizedParentPath =
-      separatorIndex < 0 ? '' : normalizedPath.slice(0, separatorIndex);
-
-    if (directChildrenOnly) {
-      return normalizedParentPath === normalizedScope;
-    }
-    return normalizedScope.length === 0 || normalizedPath.startsWith(`${normalizedScope}/`);
+    return isNormalizedPathWithinScope(normalizedPath, normalizedScope, directChildrenOnly);
   }
 
   directChildren(scopePath: string, workspaceUri?: string): Iterable<PathEntry> {
@@ -471,7 +638,7 @@ export class PathSearchCatalog implements PathSearchIndex {
     const catalog = this;
     return (function* (): IterableIterator<PathEntry> {
       for (const entryId of catalog.ngramCandidateIds(query, workspaceUri)) {
-        const entry = catalog.entries[entryId];
+        const entry = catalog.getEntryById(entryId);
         if (entry) {
           yield entry;
         }
@@ -506,7 +673,7 @@ export class PathSearchCatalog implements PathSearchIndex {
     const catalog = this;
     return (function* (): IterableIterator<PathEntry> {
       for (const entryId of catalog.intersectingNgramCandidateIds(query, workspaceUri)) {
-        const entry = catalog.entries[entryId];
+        const entry = catalog.getEntryById(entryId);
         if (entry) {
           yield entry;
         }
@@ -535,7 +702,7 @@ export class PathSearchCatalog implements PathSearchIndex {
         }
         for (const entryId of bucketIds(buckets[0])) {
           if (
-            catalog.entries[entryId] &&
+            catalog.isActive(entryId) &&
             buckets.slice(1).every((bucket) => bucketContains(bucket, entryId))
           ) {
             yield entryId;
@@ -568,7 +735,7 @@ export class PathSearchCatalog implements PathSearchIndex {
           .sort((left, right) => bucketLength(left) - bucketLength(right));
         for (const entryId of bucketIds(presentBuckets[0])) {
           if (
-            catalog.entries[entryId] &&
+            catalog.isActive(entryId) &&
             presentBuckets.slice(1).every((bucket) => bucketContains(bucket, entryId))
           ) {
             yield entryId;
@@ -582,7 +749,7 @@ export class PathSearchCatalog implements PathSearchIndex {
     const catalog = this;
     return (function* (): IterableIterator<PathEntry> {
       for (const entryId of catalog.workspaceCandidateIds(workspaceUri)) {
-        const entry = catalog.entries[entryId];
+        const entry = catalog.getEntryById(entryId);
         if (entry) {
           yield entry;
         }
@@ -600,11 +767,12 @@ export class PathSearchCatalog implements PathSearchIndex {
   }
 
   activeEntriesSnapshot(): PathEntry[] {
-    return this.entries.filter((entry): entry is PathEntry => entry !== undefined);
+    return [...this.activeEntries()];
   }
 
   *activeEntries(): IterableIterator<PathEntry> {
-    for (const entry of this.entries) {
+    for (let entryId = 0; entryId < this.relativePaths.length; entryId += 1) {
+      const entry = this.getEntryById(entryId);
       if (entry) {
         yield entry;
       }
@@ -613,7 +781,7 @@ export class PathSearchCatalog implements PathSearchIndex {
 
   private *activeEntriesFromIds(entryIds: Iterable<number>): IterableIterator<PathEntry> {
     for (const entryId of entryIds) {
-      const entry = this.entries[entryId];
+      const entry = this.getEntryById(entryId);
       if (entry) {
         yield entry;
       }
@@ -622,7 +790,7 @@ export class PathSearchCatalog implements PathSearchIndex {
 
   private *activeEntryIds(entryIds: Iterable<number>): IterableIterator<PathEntryId> {
     for (const entryId of entryIds) {
-      if (this.entries[entryId]) {
+      if (this.isActive(entryId)) {
         yield entryId;
       }
     }
@@ -644,8 +812,7 @@ export class PathSearchCatalog implements PathSearchIndex {
   ): number | undefined {
     const normalizedPath = normalizeSearchText(relativePath).replace(/\/$/, '');
     for (const entryId of bucketIds(workspace.idsByNormalizedPath.get(normalizedPath))) {
-      const entry = this.entries[entryId];
-      if (entry?.relativePath === relativePath) {
+      if (this.relativePaths[entryId] === relativePath) {
         return entryId;
       }
     }
@@ -658,7 +825,7 @@ export class PathSearchCatalog implements PathSearchIndex {
   ): number | undefined {
     const normalizedPath = normalizeSearchText(relativePath).replace(/\/$/, '');
     for (const entryId of bucketIds(workspace.idsByNormalizedPath.get(normalizedPath))) {
-      if (this.entries[entryId]) {
+      if (this.isActive(entryId)) {
         return entryId;
       }
     }
@@ -707,6 +874,10 @@ export class PathSearchCatalog implements PathSearchIndex {
     }
     const workspace = this.workspaces.get(workspaceUri);
     return workspace ? [workspace] : [];
+  }
+
+  private isActive(entryId: number): boolean {
+    return this.relativePaths[entryId] !== undefined;
   }
 }
 
@@ -801,7 +972,15 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
       return;
     }
     const compacted = new PathSearchCatalog();
-    compacted.addEntries([...existing.activeEntries()]);
+    let batch: PathEntry[] = [];
+    for (const entry of existing.activeEntries()) {
+      batch.push(entry);
+      if (batch.length >= 5_000) {
+        compacted.addEntries(batch);
+        batch = [];
+      }
+    }
+    compacted.addEntries(batch);
     compacted.seal();
     this.replaceWorkspace(workspaceUri, compacted);
   }
@@ -858,6 +1037,36 @@ export class PartitionedPathSearchCatalog implements PathSearchIndex {
   getEntryById(entryId: PathEntryId): PathEntry | undefined {
     const { partitionId, localId } = this.decodeId(entryId);
     return this.partitionsById.get(partitionId)?.getEntryById(localId);
+  }
+
+  entryKindById(entryId: PathEntryId): PathEntryKind | undefined {
+    const { partitionId, localId } = this.decodeId(entryId);
+    return this.partitionsById.get(partitionId)?.entryKindById(localId);
+  }
+
+  entryRelativePathById(entryId: PathEntryId): string | undefined {
+    const { partitionId, localId } = this.decodeId(entryId);
+    return this.partitionsById.get(partitionId)?.entryRelativePathById(localId);
+  }
+
+  scoreEntryById(
+    entryId: PathEntryId,
+    normalizedQuery: string,
+    fuzzyMatching = true,
+  ): number | undefined {
+    const { partitionId, localId } = this.decodeId(entryId);
+    return this.partitionsById.get(partitionId)
+      ?.scoreEntryById(localId, normalizedQuery, fuzzyMatching);
+  }
+
+  isEntryIdWithinNormalizedScope(
+    entryId: PathEntryId,
+    normalizedScope: string,
+    directChildrenOnly = false,
+  ): boolean {
+    const { partitionId, localId } = this.decodeId(entryId);
+    return this.partitionsById.get(partitionId)
+      ?.isEntryIdWithinNormalizedScope(localId, normalizedScope, directChildrenOnly) ?? false;
   }
 
   getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined {

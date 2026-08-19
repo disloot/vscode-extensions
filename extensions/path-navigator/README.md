@@ -29,6 +29,8 @@ workspace-relative paths.
   complete cached path list in memory.
 - Keep a compact catalog per workspace root and replace one partition at a time during refresh;
   completed and unchanged roots remain searchable throughout the rebuild.
+- Retain paths in compact columns and materialize objects only for the final visible results,
+  direct lookups, and bounded persistence batches.
 - Persist each workspace-root partition independently and rewrite only partitions changed by
   incremental file-system events.
 - Optionally build a shallow initial index and load a directory subtree when it is entered.
@@ -58,9 +60,10 @@ Prefix the input with `//` when slashes should be part of a global full-path que
 instead of an exact directory scope. For example, `//src/comp/button` can rank
 `src/components/Button.tsx` without completing `src/` and `components/` first.
 
-Large workspaces use a compact structured index: shared workspace metadata, per-root catalogs,
-numeric entry IDs, packed posting lists, name n-grams, and path-segment prefixes. Candidate
-retrieval, reuse, and deduplication remain numeric until the final Top-K paths are displayed.
+Large workspaces use a compact columnar index: shared workspace metadata, per-root catalogs,
+string path columns, typed kind/workspace columns, numeric entry IDs, packed posting lists,
+name n-grams, and path-segment prefixes. Candidate retrieval, filtering, scoring, reuse, and
+deduplication remain numeric until the final Top-K paths are displayed.
 A one-character query searches
 recent paths and file-name prefixes. A two-character query searches prefixes and
 continuous name substrings. Queries of three or more characters first intersect several

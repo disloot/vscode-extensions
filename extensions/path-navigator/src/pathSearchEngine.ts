@@ -7,7 +7,6 @@ import {
   normalizeSearchQuery,
   normalizeSearchText,
   scorePathWithNormalizedQuery,
-  TopKPathRanker,
 } from './search';
 
 export interface PathUsage {
@@ -163,6 +162,178 @@ function entryKindIsIncluded(entry: PathEntry, request: PathSearchRequest): bool
     : request.includeDirectories !== false;
 }
 
+function kindIsIncluded(
+  kind: PathEntry['kind'] | undefined,
+  request: PathSearchRequest,
+): boolean {
+  return kind === 'file'
+    ? request.includeFiles !== false
+    : kind === 'directory' && request.includeDirectories !== false;
+}
+
+interface RankedCandidate {
+  readonly entryId?: PathEntryId;
+  readonly entry?: PathEntry;
+  readonly kind: PathEntry['kind'];
+  readonly relativePath: string;
+  readonly score: number;
+  readonly inputIndex: number;
+}
+
+function compareCandidates(left: RankedCandidate, right: RankedCandidate): number {
+  if (right.score !== left.score) {
+    return right.score - left.score;
+  }
+  if (left.kind !== right.kind) {
+    return left.kind === 'directory' ? -1 : 1;
+  }
+  const pathComparison = left.relativePath.localeCompare(right.relativePath);
+  return pathComparison !== 0 ? pathComparison : left.inputIndex - right.inputIndex;
+}
+
+function candidateValuesAreBetter(
+  score: number,
+  kind: PathEntry['kind'],
+  relativePath: string,
+  inputIndex: number,
+  currentWorst: RankedCandidate,
+): boolean {
+  if (currentWorst.score !== score) {
+    return score > currentWorst.score;
+  }
+  if (kind !== currentWorst.kind) {
+    return kind === 'directory';
+  }
+  const pathComparison = relativePath.localeCompare(currentWorst.relativePath);
+  return pathComparison !== 0
+    ? pathComparison < 0
+    : inputIndex < currentWorst.inputIndex;
+}
+
+/** Retains only Top-K references and materializes indexed entries at publication time. */
+class IndexedTopKRanker {
+  private readonly heap: RankedCandidate[] = [];
+  private readonly limit: number;
+  private inputIndex = 0;
+
+  constructor(
+    private readonly catalog: PathSearchIndex,
+    maxResults: number,
+  ) {
+    this.limit = Number.isFinite(maxResults)
+      ? Math.max(0, Math.floor(maxResults))
+      : 0;
+  }
+
+  considerEntryId(entryId: PathEntryId, score: number | undefined): void {
+    const inputIndex = this.inputIndex++;
+    if (score === undefined || this.limit === 0) {
+      return;
+    }
+    const kind = this.catalog.entryKindById(entryId);
+    const relativePath = this.catalog.entryRelativePathById(entryId);
+    if (kind === undefined || relativePath === undefined) {
+      return;
+    }
+    this.considerValues(entryId, undefined, kind, relativePath, score, inputIndex);
+  }
+
+  considerEntry(entry: PathEntry, score: number | undefined): void {
+    const inputIndex = this.inputIndex++;
+    if (score === undefined || this.limit === 0) {
+      return;
+    }
+    this.considerValues(
+      undefined,
+      entry,
+      entry.kind,
+      entry.relativePath,
+      score,
+      inputIndex,
+    );
+  }
+
+  results(): PathEntry[] {
+    const results: PathEntry[] = [];
+    for (const candidate of [...this.heap].sort(compareCandidates)) {
+      const entry = candidate.entry ??
+        (candidate.entryId === undefined
+          ? undefined
+          : this.catalog.getEntryById(candidate.entryId));
+      if (entry) {
+        results.push(entry);
+      }
+    }
+    return results;
+  }
+
+  private considerValues(
+    entryId: PathEntryId | undefined,
+    entry: PathEntry | undefined,
+    kind: PathEntry['kind'],
+    relativePath: string,
+    score: number,
+    inputIndex: number,
+  ): void {
+    if (this.heap.length < this.limit) {
+      this.pushWorstFirst({ entryId, entry, kind, relativePath, score, inputIndex });
+      return;
+    }
+    if (!candidateValuesAreBetter(
+      score,
+      kind,
+      relativePath,
+      inputIndex,
+      this.heap[0],
+    )) {
+      return;
+    }
+    this.heap[0] = { entryId, entry, kind, relativePath, score, inputIndex };
+    this.siftWorstDown();
+  }
+
+  private pushWorstFirst(candidate: RankedCandidate): void {
+    this.heap.push(candidate);
+    let index = this.heap.length - 1;
+    while (index > 0) {
+      const parentIndex = Math.floor((index - 1) / 2);
+      if (compareCandidates(this.heap[index], this.heap[parentIndex]) <= 0) {
+        return;
+      }
+      [this.heap[index], this.heap[parentIndex]] =
+        [this.heap[parentIndex], this.heap[index]];
+      index = parentIndex;
+    }
+  }
+
+  private siftWorstDown(): void {
+    let index = 0;
+    while (true) {
+      const leftIndex = index * 2 + 1;
+      const rightIndex = leftIndex + 1;
+      let worstIndex = index;
+      if (
+        leftIndex < this.heap.length &&
+        compareCandidates(this.heap[leftIndex], this.heap[worstIndex]) > 0
+      ) {
+        worstIndex = leftIndex;
+      }
+      if (
+        rightIndex < this.heap.length &&
+        compareCandidates(this.heap[rightIndex], this.heap[worstIndex]) > 0
+      ) {
+        worstIndex = rightIndex;
+      }
+      if (worstIndex === index) {
+        return;
+      }
+      [this.heap[index], this.heap[worstIndex]] =
+        [this.heap[worstIndex], this.heap[index]];
+      index = worstIndex;
+    }
+  }
+}
+
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
@@ -174,7 +345,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
     request.globalPathQuery === true,
   );
   const normalizedScope = normalizeSearchText(request.scopePath).replace(/\/$/, '');
-  const ranker = new TopKPathRanker<PathEntry>(request.maxResults);
+  const ranker = new IndexedTopKRanker(request.catalog, request.maxResults);
   const seenEntryIds = new Set<PathEntryId>();
   const reusableCandidateIds: PathEntryId[] = [];
   const now = request.now ?? Date.now();
@@ -183,20 +354,40 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
   let truncated = false;
 
   for (const usage of request.recentPaths) {
-    const identity = pathIdentity(usage.entry);
-    const entryId = request.catalog.getEntryId(identity);
-    const entry =
-      (entryId === undefined ? undefined : request.catalog.getEntryById(entryId)) ??
-      (request.allowUnindexedRecentPaths ? usage.entry : undefined);
-    if (!entry) {
+    if (request.workspaceUri && usage.entry.workspaceUri !== request.workspaceUri) {
       continue;
     }
-    if (!entryKindIsIncluded(entry, request)) {
+    const identity = pathIdentity(usage.entry);
+    const entryId = request.catalog.getEntryId(identity);
+    if (entryId !== undefined) {
+      if (!kindIsIncluded(request.catalog.entryKindById(entryId), request)) {
+        continue;
+      }
+      if (!request.catalog.isEntryIdWithinNormalizedScope(
+        entryId,
+        normalizedScope,
+        normalizedQuery.length === 0,
+      )) {
+        continue;
+      }
+      const score = request.catalog.scoreEntryById(
+        entryId,
+        normalizedQuery,
+        request.fuzzyMatching !== false,
+      );
+      if (score === undefined) {
+        continue;
+      }
+      seenEntryIds.add(entryId);
+      ranker.considerEntryId(entryId, score + usageScoreBoost(usage, now));
+      reusableCandidateIds.push(entryId);
       continue;
     }
     if (
+      !request.allowUnindexedRecentPaths ||
+      !entryKindIsIncluded(usage.entry, request) ||
       !recentPathBelongsToRequest(
-        entry,
+        usage.entry,
         request.scopePath,
         normalizedQuery.length,
         request.workspaceUri,
@@ -205,28 +396,18 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       continue;
     }
     const score = scorePathWithNormalizedQuery(
-      entry,
+      usage.entry,
       normalizedQuery,
       request.fuzzyMatching !== false,
-      entryId === undefined
-        ? undefined
-        : request.catalog.normalizedWorkspaceNameForEntry(entry),
     );
-    if (score === undefined) {
-      continue;
-    }
-    if (entryId !== undefined) {
-      seenEntryIds.add(entryId);
-    }
-    ranker.consider(entry, score + usageScoreBoost(usage, now));
-    if (entryId !== undefined) {
-      reusableCandidateIds.push(entryId);
+    if (score !== undefined) {
+      ranker.considerEntry(usage.entry, score + usageScoreBoost(usage, now));
     }
   }
 
   const publish = (complete: boolean): void => {
     request.onProgress({
-      entries: ranker.results().map(({ item }) => item),
+      entries: ranker.results(),
       complete,
       processedCandidates,
       truncated,
@@ -290,14 +471,17 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       continue;
     }
     seenEntryIds.add(entryId);
-    const entry = request.catalog.getEntryById(entryId);
-    if (!entry || !entryKindIsIncluded(entry, request)) {
+    if (!kindIsIncluded(request.catalog.entryKindById(entryId), request)) {
       continue;
     }
 
     const directChildrenOnly = normalizedQuery.length === 0;
     if (
-      !request.catalog.isWithinNormalizedScope(entry, normalizedScope, directChildrenOnly)
+      !request.catalog.isEntryIdWithinNormalizedScope(
+        entryId,
+        normalizedScope,
+        directChildrenOnly,
+      )
     ) {
       continue;
     }
@@ -307,13 +491,12 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       break;
     }
     processedCandidates += 1;
-    const score = scorePathWithNormalizedQuery(
-      entry,
+    const score = request.catalog.scoreEntryById(
+      entryId,
       normalizedQuery,
       request.fuzzyMatching !== false,
-      request.catalog.normalizedWorkspaceNameForEntry(entry),
     );
-    ranker.consider(entry, score);
+    ranker.considerEntryId(entryId, score);
     if (score !== undefined) {
       reusableCandidateIds.push(entryId);
     }
