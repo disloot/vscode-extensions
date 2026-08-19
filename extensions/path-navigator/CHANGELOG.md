@@ -1,5 +1,27 @@
 # Change Log
 
+## 1.1.0
+
+- Persist every workspace-root partition in an independent v5 streamed cache file.
+- Rewrite only dirty workspace partitions after incremental file-system changes.
+- Eliminate the second directory-tree scan previously used to reclaim unused multi-root quotas.
+- Scan estimated smaller partitions first and redistribute the remaining global entry budget once.
+- Cover provider-backed Remote file creation and deletion in the VS Code Extension Host suite.
+
+## 1.0.0
+
+- Use the native VS Code `workspace.fs` provider as the single indexing backend.
+- Remove external Git, fd, ripgrep, backend-selection, and auto-probing code.
+- Partition the compact structured index by workspace root and atomically refresh one root at
+  a time while completed and unchanged partitions remain searchable.
+- Restore the v4 compressed cache in bounded 5,000-entry streaming batches instead of
+  materializing the complete cache before publishing results.
+- Add compact path-segment prefix postings for selective global full-path queries.
+- Remember query-to-result selections and use bounded query-specific ranking affinity.
+- Reduce the default visible result limit from 200 to 50.
+- Add VS Code Extension Host integration tests for local and provider-backed remote file systems,
+  including a multi-batch streamed-cache round trip.
+
 ## 0.8.0
 
 - Share workspace metadata through compact entry prototypes instead of repeating it on every path.

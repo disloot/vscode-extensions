@@ -10,6 +10,6 @@
     "compile": "npm run compile --workspaces --if-present",
     "check": "npm run check --workspaces --if-present",
     "test": "npm test --workspaces --if-present",
-    "package:path-navigator": "npm run vscode:prepublish --workspace extensions/path-navigator"
+    "package:path-navigator": "npm run package:vsix --workspace extensions/path-navigator"
   }
 }

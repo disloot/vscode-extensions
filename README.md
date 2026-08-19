@@ -20,5 +20,5 @@ npm run check
 npm test
 ```
 
-To package an extension, run `npx @vscode/vsce package` from that extension's
-directory.
+To package Path Navigator without letting npm workspace dependency discovery pull
+monorepo files into the artifact, run `npm run package:path-navigator`.

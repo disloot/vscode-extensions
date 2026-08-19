@@ -4,7 +4,7 @@ const {
   createCompactPathEntry,
   createPathWorkspaceMetadata,
 } = require('../dist/pathEntry');
-const { PathSearchCatalog } = require('../dist/pathSearchCatalog');
+const { PartitionedPathSearchCatalog } = require('../dist/pathSearchCatalog');
 const { searchPaths } = require('../dist/pathSearchEngine');
 
 const entryCount = Number(process.argv[2] ?? 100_000);
@@ -32,7 +32,7 @@ async function main() {
     }, workspaceMetadata);
   });
   const entryHeap = heapMiB();
-  const catalog = new PathSearchCatalog();
+  const catalog = new PartitionedPathSearchCatalog();
   const catalogStartedAt = performance.now();
   catalog.addEntries(entries);
   catalog.seal();

@@ -248,7 +248,7 @@ export class PathPicker {
           )
         : -1;
       const configuration = vscode.workspace.getConfiguration('pathNavigator');
-      const maxResults = configuration.get<number>('maxResults', 200);
+      const maxResults = configuration.get<number>('maxResults', 50);
       const resultPathDisplay = configuration.get<ResultPathDisplay>(
         'resultPathDisplay',
         'parent',
@@ -317,7 +317,7 @@ export class PathPicker {
 
       const generation = ++searchGeneration;
       const configuration = vscode.workspace.getConfiguration('pathNavigator');
-      const maxResults = configuration.get<number>('maxResults', 200);
+      const maxResults = configuration.get<number>('maxResults', 50);
       const maxCandidates = configuration.get<number>('maxSearchCandidates', 10_000);
       const timeBudgetMs = configuration.get<number>('searchTimeBudgetMs', 150);
       const includeFiles = showFiles;
@@ -330,7 +330,7 @@ export class PathPicker {
       const catalog = this.index.currentSearchCatalog;
       const catalogRevision = catalog.revision;
       const workspaceUri = this.workspaceLock?.workspaceUri;
-      const recentPaths = this.recentPaths.getUsages();
+      const recentPaths = this.recentPaths.getUsages(query);
       const normalizedScope = normalizeSearchText(scopePath).replace(/\/$/, '');
       const normalizedQuery = normalizeSearchQuery(query);
       const reuseContextKey = JSON.stringify([
@@ -405,7 +405,10 @@ export class PathPicker {
         publishIntermediateResults: progressiveSearchResults,
         reuse,
         isCancelled: () =>
-          generation !== searchGeneration || this.activePicker !== picker,
+          generation !== searchGeneration ||
+          this.activePicker !== picker ||
+          this.index.currentSearchCatalog !== catalog ||
+          catalog.revision !== catalogRevision,
         onProgress: (progress) => {
           if (generation !== searchGeneration || this.activePicker !== picker) {
             return;
@@ -507,8 +510,9 @@ export class PathPicker {
           this.completeEntry(selected.entry, picker);
           return;
         }
+        const { query } = parsePathInput(picker.value);
         picker.hide();
-        void this.openEntry(selected.entry);
+        void this.openEntry(selected.entry, query);
       }),
       picker.onDidTriggerButton((button) => {
         if (button === fileFilterButton) {
@@ -585,6 +589,7 @@ export class PathPicker {
           'pathNavigator.maxSearchCandidates',
           'pathNavigator.searchTimeBudgetMs',
           'pathNavigator.recentPathsLimit',
+          'pathNavigator.queryHistoryLimit',
           'pathNavigator.progressiveSearchResults',
         ];
         if (searchKeys.some((key) => event.affectsConfiguration(key))) {
@@ -720,7 +725,7 @@ export class PathPicker {
     };
   }
 
-  private async openEntry(entry: PathEntry): Promise<void> {
+  private async openEntry(entry: PathEntry, query: string): Promise<void> {
     const entryUri = entry.uri ?? vscode.Uri.joinPath(
       vscode.Uri.parse(entry.workspaceUri),
       ...entry.relativePath.split('/'),
@@ -747,6 +752,7 @@ export class PathPicker {
       try {
         await vscode.commands.executeCommand('vscode.open', entryUri, { preview });
         this.recentPaths.record(entry);
+        this.recentPaths.recordQuerySelection(query, entry);
       } catch (error) {
         void vscode.window.showErrorMessage(`Could not open ${entry.relativePath}: ${String(error)}`);
       }
@@ -756,6 +762,7 @@ export class PathPicker {
     try {
       await vscode.commands.executeCommand('revealInExplorer', entryUri);
       this.recentPaths.record(entry);
+      this.recentPaths.recordQuerySelection(query, entry);
     } catch (error) {
       void vscode.window.showErrorMessage(
         `Could not reveal ${entry.relativePath} in Explorer: ${String(error)}`,

@@ -2,7 +2,7 @@
   "name": "path-navigator",
   "displayName": "Path Navigator",
   "description": "Quickly open files or reveal directories by searching their workspace-relative paths.",
-  "version": "0.8.0",
+  "version": "1.1.0",
   "publisher": "Disloot",
   "icon": "resources/icon.png",
   "license": "MIT",
@@ -152,7 +152,7 @@
       "properties": {
         "pathNavigator.maxResults": {
           "type": "number",
-          "default": 200,
+          "default": 50,
           "minimum": 20,
           "maximum": 2000,
           "description": "Maximum number of matching files and directories shown in the picker."
@@ -251,25 +251,6 @@
           "maximum": 100000,
           "description": "Maximum number of coalesced file-system events handled incrementally. Larger event storms trigger a full rebuild."
         },
-        "pathNavigator.indexingBackend": {
-          "type": "string",
-          "enum": [
-            "workspaceFs",
-            "auto",
-            "git",
-            "fd",
-            "rg"
-          ],
-          "enumDescriptions": [
-            "Use the portable VS Code workspace file-system API and include empty directories.",
-            "Use measured per-workspace throughput to choose workspace.fs or order fd, ripgrep, and Git, then fall back safely.",
-            "Use git ls-files and derive directories. Ignored and empty directories are omitted.",
-            "Use fd for files and directories, falling back to the workspace file-system API when unavailable.",
-            "Use ripgrep for files and derive directories. Empty directories are omitted."
-          ],
-          "default": "workspaceFs",
-          "description": "Backend used for full workspace indexing. External commands run in the local or remote workspace extension host and are disabled in untrusted workspaces."
-        },
         "pathNavigator.initialIndexDepth": {
           "type": "number",
           "default": 0,
@@ -314,6 +295,13 @@
           "minimum": 0,
           "maximum": 1000,
           "description": "Maximum number of recently and frequently opened workspace paths retained locally for ranking. Set to 0 to disable history."
+        },
+        "pathNavigator.queryHistoryLimit": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "Maximum number of query-to-result selections remembered for query-specific ranking. Set to 0 to disable query history."
         },
         "pathNavigator.excludeDirectoryNames": {
           "type": "array",
@@ -361,13 +349,15 @@
     "watch": "tsc -watch -p ./",
     "check": "tsc -p ./ --noEmit",
     "test": "npm run compile && node --test test/*.test.js",
+    "test:integration": "npm run compile && node test/integration/runTest.js",
     "benchmark": "npm run compile && node --expose-gc test/performance.bench.js",
-    "benchmark:backends": "npm run compile && node --expose-gc test/backend-performance.bench.js",
+    "package:vsix": "npm run vscode:prepublish && vsce package --no-dependencies",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^3.1.0",
     "typescript": "^5.9.0"
   }
 }

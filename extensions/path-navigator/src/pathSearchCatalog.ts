@@ -14,6 +14,30 @@ type IdBucket = number | number[] | PackedIdBucket;
 type BucketMap = Map<string, IdBucket>;
 export type PathEntryId = number;
 
+export interface PathSearchIndex {
+  readonly size: number;
+  readonly revision: number;
+  readonly instanceId: number;
+  getEntry(identity: string): PathEntry | undefined;
+  getEntryId(identity: string): PathEntryId | undefined;
+  getEntryById(entryId: PathEntryId): PathEntry | undefined;
+  getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined;
+  normalizedWorkspaceNameForEntry(entry: PathEntry): string;
+  isWithinNormalizedScope(
+    entry: PathEntry,
+    normalizedScope: string,
+    directChildrenOnly?: boolean,
+  ): boolean;
+  directChildIds(scopePath: string, workspaceUri?: string): Iterable<PathEntryId>;
+  exactNameCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId>;
+  prefixCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId>;
+  bigramCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId>;
+  ngramCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId>;
+  intersectingNgramCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId>;
+  pathSegmentCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId>;
+  workspaceCandidateIds(workspaceUri?: string): Iterable<PathEntryId>;
+}
+
 interface WorkspaceCatalog {
   readonly uri: string;
   readonly normalizedWorkspaceName: string;
@@ -23,6 +47,7 @@ interface WorkspaceCatalog {
   readonly entriesByExactName: BucketMap;
   readonly entriesByNamePrefix: BucketMap;
   readonly entriesByBigram: BucketMap;
+  readonly entriesBySegmentPrefix: BucketMap;
 }
 
 function appendId(bucket: IdBucket | undefined, entryId: number): IdBucket {
@@ -153,6 +178,19 @@ function uniqueNgrams(value: string, size: number): Set<string> {
   return grams;
 }
 
+function uniqueSegmentPrefixes(value: string): Set<string> {
+  const prefixes = new Set<string>();
+  for (const segment of value.split('/')) {
+    if (!segment) {
+      continue;
+    }
+    for (let size = 1; size <= Math.min(3, segment.length); size += 1) {
+      prefixes.add(segment.slice(0, size));
+    }
+  }
+  return prefixes;
+}
+
 function createWorkspaceCatalog(uri: string, normalizedWorkspaceName: string): WorkspaceCatalog {
   return {
     uri,
@@ -163,10 +201,11 @@ function createWorkspaceCatalog(uri: string, normalizedWorkspaceName: string): W
     entriesByExactName: new Map(),
     entriesByNamePrefix: new Map(),
     entriesByBigram: new Map(),
+    entriesBySegmentPrefix: new Map(),
   };
 }
 
-export class PathSearchCatalog {
+export class PathSearchCatalog implements PathSearchIndex {
   private static nextInstanceId = 1;
   private readonly entries: Array<PathEntry | undefined> = [];
   private readonly workspaces = new Map<string, WorkspaceCatalog>();
@@ -237,6 +276,9 @@ export class PathSearchCatalog {
       for (const gram of uniqueNgrams(normalizedName, 2)) {
         appendToBucket(workspace.entriesByBigram, gram, entryId);
       }
+      for (const prefix of uniqueSegmentPrefixes(normalizedPath)) {
+        appendToBucket(workspace.entriesBySegmentPrefix, prefix, entryId);
+      }
     }
     if (addedCount > 0) {
       this.catalogRevision += 1;
@@ -252,6 +294,7 @@ export class PathSearchCatalog {
       packBuckets(workspace.entriesByExactName);
       packBuckets(workspace.entriesByNamePrefix);
       packBuckets(workspace.entriesByBigram);
+      packBuckets(workspace.entriesBySegmentPrefix);
     }
   }
 
@@ -502,6 +545,39 @@ export class PathSearchCatalog {
     })();
   }
 
+  pathSegmentCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    const normalizedQuery = normalizeSearchQuery(query);
+    const segmentPrefixes = [...new Set(
+      normalizedQuery
+        .split('/')
+        .filter(Boolean)
+        .map((segment) => segment.slice(0, Math.min(3, segment.length))),
+    )];
+    if (segmentPrefixes.length < 2) {
+      return [];
+    }
+    const catalog = this;
+    return (function* (): IterableIterator<PathEntryId> {
+      for (const workspace of catalog.selectedWorkspaces(workspaceUri)) {
+        const buckets = segmentPrefixes
+          .map((prefix) => workspace.entriesBySegmentPrefix.get(prefix));
+        if (buckets.some((bucket) => bucket === undefined)) {
+          continue;
+        }
+        const presentBuckets = (buckets as IdBucket[])
+          .sort((left, right) => bucketLength(left) - bucketLength(right));
+        for (const entryId of bucketIds(presentBuckets[0])) {
+          if (
+            catalog.entries[entryId] &&
+            presentBuckets.slice(1).every((bucket) => bucketContains(bucket, entryId))
+          ) {
+            yield entryId;
+          }
+        }
+      }
+    })();
+  }
+
   workspaceCandidates(workspaceUri?: string): Iterable<PathEntry> {
     const catalog = this;
     return (function* (): IterableIterator<PathEntry> {
@@ -594,7 +670,8 @@ export class PathSearchCatalog {
       | 'childrenByParent'
       | 'entriesByExactName'
       | 'entriesByNamePrefix'
-      | 'entriesByBigram',
+      | 'entriesByBigram'
+      | 'entriesBySegmentPrefix',
     token: string,
     workspaceUri?: string,
   ): Iterable<PathEntry> {
@@ -611,7 +688,8 @@ export class PathSearchCatalog {
       | 'childrenByParent'
       | 'entriesByExactName'
       | 'entriesByNamePrefix'
-      | 'entriesByBigram',
+      | 'entriesByBigram'
+      | 'entriesBySegmentPrefix',
     token: string,
     workspaceUri?: string,
   ): Iterable<PathEntryId> {
@@ -629,5 +707,271 @@ export class PathSearchCatalog {
     }
     const workspace = this.workspaces.get(workspaceUri);
     return workspace ? [workspace] : [];
+  }
+}
+
+const PARTITION_ID_STRIDE = 0x1_0000_0000;
+
+/**
+ * Keeps each workspace in an independently replaceable compact catalog. Encoded
+ * entry IDs remain numeric, while a background refresh only duplicates the
+ * workspace partition currently being rebuilt.
+ */
+export class PartitionedPathSearchCatalog implements PathSearchIndex {
+  private static nextInstanceId = 1_000_000;
+  private readonly partitionsByUri = new Map<string, {
+    readonly partitionId: number;
+    catalog: PathSearchCatalog;
+  }>();
+  private readonly partitionsById = new Map<number, PathSearchCatalog>();
+  private nextPartitionId = 1;
+  private catalogRevision = 0;
+  readonly instanceId = PartitionedPathSearchCatalog.nextInstanceId++;
+
+  get size(): number {
+    let size = 0;
+    for (const { catalog } of this.partitionsByUri.values()) {
+      size += catalog.size;
+    }
+    return size;
+  }
+
+  get revision(): number {
+    return this.catalogRevision;
+  }
+
+  get tombstoneRatio(): number {
+    let capacity = 0;
+    let removed = 0;
+    for (const { catalog } of this.partitionsByUri.values()) {
+      capacity += catalog.capacity;
+      removed += catalog.capacity - catalog.size;
+    }
+    return capacity === 0 ? 0 : removed / capacity;
+  }
+
+  replaceWorkspace(workspaceUri: string, catalog: PathSearchCatalog): void {
+    const existing = this.partitionsByUri.get(workspaceUri);
+    if (existing) {
+      this.partitionsById.delete(existing.partitionId);
+    }
+    // A replacement receives a fresh namespace so numeric IDs captured by an
+    // in-flight search can never resolve to unrelated entries in the new root.
+    const partitionId = this.nextPartitionId++;
+    this.partitionsByUri.set(workspaceUri, { partitionId, catalog });
+    this.partitionsById.set(partitionId, catalog);
+    this.catalogRevision += 1;
+  }
+
+  removeWorkspace(workspaceUri: string): void {
+    const existing = this.partitionsByUri.get(workspaceUri);
+    if (!existing) {
+      return;
+    }
+    this.partitionsByUri.delete(workspaceUri);
+    this.partitionsById.delete(existing.partitionId);
+    this.catalogRevision += 1;
+  }
+
+  workspaceCatalog(workspaceUri: string): PathSearchCatalog | undefined {
+    return this.partitionsByUri.get(workspaceUri)?.catalog;
+  }
+
+  workspaceUris(): readonly string[] {
+    return [...this.partitionsByUri.keys()];
+  }
+
+  ensureWorkspaceCatalog(workspaceUri: string): PathSearchCatalog {
+    const existing = this.workspaceCatalog(workspaceUri);
+    if (existing) {
+      return existing;
+    }
+    const catalog = new PathSearchCatalog();
+    this.replaceWorkspace(workspaceUri, catalog);
+    return catalog;
+  }
+
+  markWorkspaceChanged(): void {
+    this.catalogRevision += 1;
+  }
+
+  compactWorkspace(workspaceUri: string): void {
+    const existing = this.workspaceCatalog(workspaceUri);
+    if (!existing) {
+      return;
+    }
+    const compacted = new PathSearchCatalog();
+    compacted.addEntries([...existing.activeEntries()]);
+    compacted.seal();
+    this.replaceWorkspace(workspaceUri, compacted);
+  }
+
+  addEntries(entries: readonly PathEntry[]): number {
+    const entriesByWorkspace = new Map<string, PathEntry[]>();
+    for (const entry of entries) {
+      const bucket = entriesByWorkspace.get(entry.workspaceUri) ?? [];
+      bucket.push(entry);
+      entriesByWorkspace.set(entry.workspaceUri, bucket);
+    }
+    let added = 0;
+    for (const [workspaceUri, workspaceEntries] of entriesByWorkspace) {
+      added += this.ensureWorkspaceCatalog(workspaceUri).addEntries(workspaceEntries);
+    }
+    if (added > 0) {
+      this.catalogRevision += 1;
+    }
+    return added;
+  }
+
+  removePath(workspaceUri: string, relativePath: string, recursive = true): number {
+    const removed = this.workspaceCatalog(workspaceUri)
+      ?.removePath(workspaceUri, relativePath, recursive) ?? 0;
+    if (removed > 0) {
+      this.catalogRevision += 1;
+    }
+    return removed;
+  }
+
+  seal(): void {
+    for (const { catalog } of this.partitionsByUri.values()) {
+      catalog.seal();
+    }
+  }
+
+  getEntry(identity: string): PathEntry | undefined {
+    const entryId = this.getEntryId(identity);
+    return entryId === undefined ? undefined : this.getEntryById(entryId);
+  }
+
+  getEntryId(identity: string): PathEntryId | undefined {
+    const separatorIndex = identity.indexOf('\0');
+    if (separatorIndex < 0) {
+      return undefined;
+    }
+    const partition = this.partitionsByUri.get(identity.slice(0, separatorIndex));
+    const localId = partition?.catalog.getEntryId(identity);
+    return partition && localId !== undefined
+      ? this.encodeId(partition.partitionId, localId)
+      : undefined;
+  }
+
+  getEntryById(entryId: PathEntryId): PathEntry | undefined {
+    const { partitionId, localId } = this.decodeId(entryId);
+    return this.partitionsById.get(partitionId)?.getEntryById(localId);
+  }
+
+  getEntryByPath(workspaceUri: string, relativePath: string): PathEntry | undefined {
+    return this.workspaceCatalog(workspaceUri)?.getEntryByPath(workspaceUri, relativePath);
+  }
+
+  normalizedWorkspaceNameForEntry(entry: PathEntry): string {
+    return this.workspaceCatalog(entry.workspaceUri)
+      ?.normalizedWorkspaceNameForEntry(entry) ?? normalizeSearchText(entry.workspaceName);
+  }
+
+  isWithinNormalizedScope(
+    entry: PathEntry,
+    normalizedScope: string,
+    directChildrenOnly = false,
+  ): boolean {
+    const partition = this.workspaceCatalog(entry.workspaceUri);
+    return partition?.isWithinNormalizedScope(entry, normalizedScope, directChildrenOnly) ?? false;
+  }
+
+  directChildIds(scopePath: string, workspaceUri?: string): Iterable<PathEntryId> {
+    return this.delegateIds('directChildIds', scopePath, workspaceUri);
+  }
+
+  exactNameCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    return this.delegateIds('exactNameCandidateIds', query, workspaceUri);
+  }
+
+  prefixCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    return this.delegateIds('prefixCandidateIds', query, workspaceUri);
+  }
+
+  bigramCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    return this.delegateIds('bigramCandidateIds', query, workspaceUri);
+  }
+
+  ngramCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    return this.delegateIds('ngramCandidateIds', query, workspaceUri);
+  }
+
+  intersectingNgramCandidateIds(
+    query: string,
+    workspaceUri?: string,
+  ): Iterable<PathEntryId> {
+    return this.delegateIds('intersectingNgramCandidateIds', query, workspaceUri);
+  }
+
+  pathSegmentCandidateIds(query: string, workspaceUri?: string): Iterable<PathEntryId> {
+    return this.delegateIds('pathSegmentCandidateIds', query, workspaceUri);
+  }
+
+  workspaceCandidateIds(workspaceUri?: string): Iterable<PathEntryId> {
+    const catalog = this;
+    return (function* (): IterableIterator<PathEntryId> {
+      for (const partition of catalog.selectedPartitions(workspaceUri)) {
+        for (const localId of partition.catalog.workspaceCandidateIds(workspaceUri)) {
+          yield catalog.encodeId(partition.partitionId, localId);
+        }
+      }
+    })();
+  }
+
+  *activeEntries(): IterableIterator<PathEntry> {
+    for (const { catalog } of this.partitionsByUri.values()) {
+      yield* catalog.activeEntries();
+    }
+  }
+
+  activeEntriesSnapshot(): PathEntry[] {
+    return [...this.activeEntries()];
+  }
+
+  private delegateIds(
+    method:
+      | 'directChildIds'
+      | 'exactNameCandidateIds'
+      | 'prefixCandidateIds'
+      | 'bigramCandidateIds'
+      | 'ngramCandidateIds'
+      | 'intersectingNgramCandidateIds'
+      | 'pathSegmentCandidateIds',
+    query: string,
+    workspaceUri?: string,
+  ): Iterable<PathEntryId> {
+    const catalog = this;
+    return (function* (): IterableIterator<PathEntryId> {
+      for (const partition of catalog.selectedPartitions(workspaceUri)) {
+        for (const localId of partition.catalog[method](query, workspaceUri)) {
+          yield catalog.encodeId(partition.partitionId, localId);
+        }
+      }
+    })();
+  }
+
+  private selectedPartitions(workspaceUri?: string): Iterable<{
+    readonly partitionId: number;
+    readonly catalog: PathSearchCatalog;
+  }> {
+    if (!workspaceUri) {
+      return this.partitionsByUri.values();
+    }
+    const partition = this.partitionsByUri.get(workspaceUri);
+    return partition ? [partition] : [];
+  }
+
+  private encodeId(partitionId: number, localId: number): number {
+    return partitionId * PARTITION_ID_STRIDE + localId;
+  }
+
+  private decodeId(entryId: number): { partitionId: number; localId: number } {
+    const partitionId = Math.floor(entryId / PARTITION_ID_STRIDE);
+    return {
+      partitionId,
+      localId: entryId - partitionId * PARTITION_ID_STRIDE,
+    };
   }
 }

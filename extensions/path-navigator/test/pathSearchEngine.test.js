@@ -129,6 +129,23 @@ test('recent and frequently opened paths receive a bounded ranking boost', async
   assert.equal(progress.at(-1).entries[0].relativePath, 'src/file-b.ts');
 });
 
+test('query history can promote the result previously selected for that query', async () => {
+  const preferred = entry('deep/file-b.ts');
+  const progress = await search([entry('file-a.ts'), preferred], {
+    query: 'file',
+    maxResults: 1,
+    recentPaths: [{
+      entry: preferred,
+      lastOpenedAt: 0,
+      openCount: 0,
+      queryAffinity: 3,
+    }],
+    now: 86_400_000 * 365,
+  });
+
+  assert.equal(progress.at(-1).entries[0].relativePath, preferred.relativePath);
+});
+
 test('candidate limits mark expanded searches as truncated', async () => {
   const progress = await search(
     [entry('src/file-a.ts'), entry('src/file-b.ts'), entry('src/file-c.ts')],

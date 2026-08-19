@@ -1,16 +1,5 @@
 import * as vscode from 'vscode';
 import {
-  prefersWorkspaceFs,
-  rankExternalBackends,
-  type StoredBackendPerformance,
-  updateBackendPerformance,
-} from './backendPerformance';
-import {
-  scanWithExternalBackend,
-  type IndexingBackend,
-  type ScannedExternalPath,
-} from './externalPathScanner';
-import {
   createCompactPathEntry,
   createPathWorkspaceMetadata,
   PathEntry,
@@ -20,14 +9,17 @@ import {
   hasExcludedFileExtension,
   normalizeExcludedFileExtensions,
 } from './pathFilters';
-import { PathSearchCatalog } from './pathSearchCatalog';
+import {
+  PartitionedPathSearchCatalog,
+  PathSearchCatalog,
+  type PathSearchIndex,
+} from './pathSearchCatalog';
 import { PathIndexPersistence } from './pathIndexPersistence';
 import { normalizeSearchText } from './search';
 
 interface IndexSnapshot {
   readonly errors: readonly string[];
   readonly partial: boolean;
-  readonly backend?: Exclude<IndexingBackend, 'auto'>;
   readonly durationMs?: number;
   readonly pathCount?: number;
 }
@@ -47,7 +39,6 @@ interface IndexConfiguration {
   readonly indexConcurrency: number;
   readonly adaptiveRemoteConcurrency: boolean;
   readonly incrementalUpdateBatchLimit: number;
-  readonly indexingBackend: IndexingBackend;
   readonly initialIndexDepth: number;
   readonly persistIndex: boolean;
   readonly persistentIndexMaxAgeHours: number;
@@ -67,8 +58,6 @@ const INCREMENTAL_UPDATE_DEBOUNCE_MS = 150;
 const DEFAULT_INCREMENTAL_UPDATE_BATCH_LIMIT = 2_000;
 const CATALOG_COMPACTION_TOMBSTONE_RATIO = 0.2;
 const CACHE_SAVE_DEBOUNCE_MS = 2_000;
-const CACHE_RESTORE_BATCH_SIZE = 5_000;
-const BACKEND_PERFORMANCE_STORAGE_KEY = 'pathNavigator.backendPerformance.v1';
 
 async function scanDirectoryWorkQueue(
   initialDirectories: readonly PendingDirectory[],
@@ -151,7 +140,7 @@ export class PathIndex implements vscode.Disposable {
   private readonly watchers: vscode.FileSystemWatcher[] = [];
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   private readonly statusEmitter = new vscode.EventEmitter<boolean>();
-  private searchCatalog = new PathSearchCatalog();
+  private searchCatalog = new PartitionedPathSearchCatalog();
   private rebuildPromise: Promise<void> | undefined;
   private updateTimer: NodeJS.Timeout | undefined;
   private readonly pendingChanges = new Map<string, PendingFileSystemChange>();
@@ -159,13 +148,13 @@ export class PathIndex implements vscode.Disposable {
   private readonly expandedScopes = new Set<string>();
   private readonly scopeIndexPromises = new Map<string, Promise<void>>();
   private readonly workspaceMetadata = new Map<string, PathWorkspaceMetadata>();
+  private readonly dirtyWorkspaceUris = new Set<string>();
   private cacheSaveTimer: NodeJS.Timeout | undefined;
   private generation = 0;
   private building = false;
   private limited = false;
   private partial = false;
   private ready = false;
-  private readonly backendPerformance: StoredBackendPerformance;
 
   readonly onDidChange = this.changeEmitter.event;
   readonly onDidChangeBuilding = this.statusEmitter.event;
@@ -173,13 +162,8 @@ export class PathIndex implements vscode.Disposable {
   constructor(
     storageUri?: vscode.Uri,
     private readonly priorityPathsProvider?: () => readonly PathEntry[],
-    private readonly workspaceState?: vscode.Memento,
   ) {
     this.persistence = new PathIndexPersistence(storageUri);
-    this.backendPerformance = workspaceState?.get<StoredBackendPerformance>(
-      BACKEND_PERFORMANCE_STORAGE_KEY,
-      {},
-    ) ?? {};
     this.disposables.push(this.changeEmitter, this.statusEmitter);
     this.disposables.push(
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -205,7 +189,6 @@ export class PathIndex implements vscode.Disposable {
           event.affectsConfiguration('pathNavigator.indexConcurrency') ||
           event.affectsConfiguration('pathNavigator.adaptiveRemoteConcurrency') ||
           event.affectsConfiguration('pathNavigator.incrementalUpdateBatchLimit') ||
-          event.affectsConfiguration('pathNavigator.indexingBackend') ||
           event.affectsConfiguration('pathNavigator.initialIndexDepth')
         ) {
           void this.rebuild();
@@ -231,7 +214,7 @@ export class PathIndex implements vscode.Disposable {
     return this.searchCatalog.size;
   }
 
-  get currentSearchCatalog(): PathSearchCatalog {
+  get currentSearchCatalog(): PathSearchIndex {
     return this.searchCatalog;
   }
 
@@ -239,6 +222,7 @@ export class PathIndex implements vscode.Disposable {
     if (this.searchCatalog.removePath(entry.workspaceUri, entry.relativePath, true) === 0) {
       return;
     }
+    this.dirtyWorkspaceUris.add(entry.workspaceUri);
     this.changeEmitter.fire();
     this.scheduleCacheSave();
   }
@@ -302,128 +286,119 @@ export class PathIndex implements vscode.Disposable {
       const folders = vscode.workspace.workspaceFolders ?? [];
       const configuration = this.readConfiguration();
       const { maxEntries } = configuration;
-      const publishIncompleteCatalog = !this.ready || this.searchCatalog.size === 0;
-      const buildingSearchCatalog = new PathSearchCatalog();
-      let acceptedEntryCount = 0;
-      let publishedEntryCount = 0;
-      let lastPublishedAt = 0;
-      let limitReached = false;
+      const orderedFolders = folders
+        .map((folder, originalIndex) => ({
+          folder,
+          originalIndex,
+          estimatedSize:
+            this.searchCatalog.workspaceCatalog(folder.uri.toString())?.size ??
+            Number.POSITIVE_INFINITY,
+        }))
+        .sort((left, right) =>
+          left.estimatedSize - right.estimatedSize || left.originalIndex - right.originalIndex,
+        )
+        .map(({ folder }) => folder);
+      const snapshots: IndexSnapshot[] = [];
+      const workspaceUris = new Set(folders.map((folder) => folder.uri.toString()));
+      let totalAccepted = 0;
+      let indexBudgetConstrained = false;
+      const firstBuild = !this.ready || this.searchCatalog.size === 0;
 
-      const publishProgress = (force = false): void => {
+      // Refresh one root at a time. The completed roots already serve new results,
+      // unchanged roots keep serving their previous partitions, and peak memory is
+      // bounded by the old index plus only the partition currently being rebuilt.
+      for (let index = 0; index < orderedFolders.length; index += 1) {
         if (requestedGeneration !== this.generation) {
           return;
         }
+        const folder = orderedFolders[index];
+        const workspaceUri = folder.uri.toString();
+        const remainingRootCount = orderedFolders.length - index;
+        const workspaceLimit = maxEntries === 0
+          ? Number.POSITIVE_INFINITY
+          : Math.ceil(Math.max(0, maxEntries - totalAccepted) / remainingRootCount);
+        const partition = new PathSearchCatalog();
+        let accepted = 0;
+        let partitionLimited = false;
+        let published = 0;
+        let lastPublishedAt = 0;
 
-        // A restored or previously completed catalog remains a consistent search
-        // snapshot while its replacement is built. First-time indexes still stream
-        // partial results so a new workspace becomes usable immediately.
-        if (!force && !publishIncompleteCatalog) {
-          return;
+        if (firstBuild) {
+          this.searchCatalog.replaceWorkspace(workspaceUri, partition);
         }
-
-        const now = Date.now();
-        const addedEntryCount = acceptedEntryCount - publishedEntryCount;
-        if (
-          !force &&
-          publishedEntryCount > 0 &&
-          addedEntryCount < PROGRESS_ENTRY_BATCH_SIZE &&
-          now - lastPublishedAt < PROGRESS_INTERVAL_MS
-        ) {
-          return;
-        }
-
-        this.searchCatalog = buildingSearchCatalog;
-        this.limited = limitReached;
-        publishedEntryCount = acceptedEntryCount;
-        lastPublishedAt = now;
-        this.changeEmitter.fire();
-      };
-
-      const acceptEntries = (
-        entries: readonly PathEntry[],
-        workspaceLimit = Number.POSITIVE_INFINITY,
-        workspaceAccepted?: { count: number },
-      ): void => {
-        const uniqueEntries = entries.filter(
-          (entry) =>
-            !buildingSearchCatalog.getEntryByPath(entry.workspaceUri, entry.relativePath),
+        const publishProgress = (): void => {
+          if (!firstBuild || requestedGeneration !== this.generation) {
+            return;
+          }
+          const now = Date.now();
+          if (
+            published > 0 &&
+            accepted - published < PROGRESS_ENTRY_BATCH_SIZE &&
+            now - lastPublishedAt < PROGRESS_INTERVAL_MS
+          ) {
+            return;
+          }
+          published = accepted;
+          lastPublishedAt = now;
+          this.searchCatalog.markWorkspaceChanged();
+          this.changeEmitter.fire();
+        };
+        const snapshot = await this.scanWorkspaceFolder(
+          folder,
+          configuration.excludedNames,
+          configuration.excludedFileExtensions,
+          (entries) => {
+            const remaining = Math.max(0, workspaceLimit - accepted);
+            const acceptedEntries = remaining >= entries.length
+              ? entries
+              : entries.slice(0, remaining);
+            accepted += partition.addEntries(acceptedEntries);
+            publishProgress();
+          },
+          () => {
+            if (requestedGeneration !== this.generation) {
+              return false;
+            }
+            if (accepted >= workspaceLimit) {
+              partitionLimited = true;
+              return false;
+            }
+            return true;
+          },
+          configuration.indexConcurrency,
+          configuration.initialIndexDepth,
+          this.priorityDirectoriesForWorkspace(workspaceUri),
+          configuration.adaptiveRemoteConcurrency,
         );
-        const globalRemaining = maxEntries === 0
-          ? uniqueEntries.length
-          : Math.max(0, maxEntries - acceptedEntryCount);
-        const workspaceRemaining = workspaceAccepted
-          ? Math.max(0, workspaceLimit - workspaceAccepted.count)
-          : uniqueEntries.length;
-        const remaining = Math.min(globalRemaining, workspaceRemaining);
-        const acceptedEntries =
-          remaining >= uniqueEntries.length
-            ? uniqueEntries
-            : uniqueEntries.slice(0, remaining);
-        if (acceptedEntries.length > 0) {
-          const addedCount = buildingSearchCatalog.addEntries(acceptedEntries);
-          acceptedEntryCount += addedCount;
-          if (workspaceAccepted) {
-            workspaceAccepted.count += addedCount;
-          }
+        if (requestedGeneration !== this.generation) {
+          return;
         }
-        if (maxEntries > 0 && acceptedEntryCount >= maxEntries) {
-          limitReached = true;
+        partition.seal();
+        if (maxEntries > 0 && partitionLimited) {
+          indexBudgetConstrained = true;
         }
-        publishProgress();
-      };
-      const fairShares = folders.map((_, index) => {
-        if (maxEntries === 0 || folders.length === 0) {
-          return Number.POSITIVE_INFINITY;
+        totalAccepted += accepted;
+        snapshots.push(snapshot);
+        if (!firstBuild) {
+          this.searchCatalog.replaceWorkspace(workspaceUri, partition);
+        } else {
+          this.searchCatalog.markWorkspaceChanged();
         }
-        const baseShare = Math.floor(maxEntries / folders.length);
-        return baseShare + (index < maxEntries % folders.length ? 1 : 0);
-      });
-      const workspaceAccepted = folders.map(() => ({ count: 0 }));
-      const snapshots = await Promise.all(
-        folders.map((folder, index) =>
-          this.scanWorkspaceFolderWithConfiguredBackend(
-            folder,
-            configuration,
-            (entries) =>
-              acceptEntries(entries, fairShares[index], workspaceAccepted[index]),
-            () =>
-              requestedGeneration === this.generation &&
-              !limitReached &&
-              workspaceAccepted[index].count < fairShares[index],
-          ),
-        ),
-      );
+        this.dirtyWorkspaceUris.add(workspaceUri);
+        this.changeEmitter.fire();
+      }
 
-      // Every root gets a fair first-pass share. If a small root does not use its
-      // reservation, rescan roots that reached their share and reclaim the spare
-      // capacity without allowing the fastest root to starve the others.
-      if (maxEntries > 0 && acceptedEntryCount < maxEntries) {
-        for (let index = 0; index < folders.length && acceptedEntryCount < maxEntries; index += 1) {
-          if (workspaceAccepted[index].count < fairShares[index]) {
-            continue;
-          }
-          const snapshot = await this.scanWorkspaceFolderWithConfiguredBackend(
-            folders[index],
-            configuration,
-            (entries) => acceptEntries(entries),
-            () => requestedGeneration === this.generation && !limitReached,
-          );
-          snapshots[index] = {
-            errors: [...snapshots[index].errors, ...snapshot.errors],
-            partial: snapshots[index].partial || snapshot.partial,
-          };
+      for (const workspaceUri of this.searchCatalog.workspaceUris()) {
+        if (!workspaceUris.has(workspaceUri)) {
+          this.searchCatalog.removeWorkspace(workspaceUri);
+          this.dirtyWorkspaceUris.delete(workspaceUri);
         }
       }
 
-      if (requestedGeneration !== this.generation) {
-        return;
-      }
-
-      buildingSearchCatalog.seal();
+      this.limited = maxEntries > 0 && (totalAccepted >= maxEntries || indexBudgetConstrained);
       this.partial = snapshots.some((snapshot) => snapshot.partial);
       this.ready = true;
       this.expandedScopes.clear();
-      publishProgress(true);
       this.scheduleCacheSave();
 
       const errors = snapshots.flatMap((snapshot) => snapshot.errors);
@@ -540,105 +515,9 @@ export class PathIndex implements vscode.Disposable {
     return {
       errors,
       partial,
-      backend: 'workspaceFs',
       durationMs: performance.now() - startedAt,
       pathCount,
     };
-  }
-
-  private async scanWorkspaceFolderWithConfiguredBackend(
-    workspaceFolder: vscode.WorkspaceFolder,
-    configuration: IndexConfiguration,
-    onEntries: (entries: readonly PathEntry[]) => void,
-    shouldContinue: () => boolean,
-  ): Promise<IndexSnapshot> {
-    const workspaceUri = workspaceFolder.uri.toString();
-    const autoPrefersWorkspaceFs =
-      configuration.indexingBackend === 'auto' &&
-      this.autoPrefersWorkspaceFs(workspaceUri);
-    if (
-      configuration.indexingBackend !== 'workspaceFs' &&
-      !autoPrefersWorkspaceFs &&
-      configuration.initialIndexDepth === 0
-    ) {
-      const externalResult = await scanWithExternalBackend({
-        backend: configuration.indexingBackend,
-        workspaceFolder,
-        excludedNames: configuration.excludedNames,
-        excludedFileExtensions: configuration.excludedFileExtensions,
-        initialDepth: configuration.initialIndexDepth,
-        preferredBackends: this.preferredExternalBackends(
-          workspaceUri,
-        ),
-        shouldContinue,
-        onPaths: (paths) => onEntries(this.createEntriesFromExternalPaths(workspaceFolder, paths)),
-      });
-      if (externalResult.handled) {
-        const snapshot: IndexSnapshot = {
-          errors: [],
-          partial: false,
-          backend: externalResult.backend,
-          durationMs: externalResult.durationMs,
-          pathCount: externalResult.pathCount,
-        };
-        this.recordBackendPerformance(workspaceUri, snapshot);
-        return snapshot;
-      }
-    }
-
-    const snapshot = await this.scanWorkspaceFolder(
-      workspaceFolder,
-      configuration.excludedNames,
-      configuration.excludedFileExtensions,
-      onEntries,
-      shouldContinue,
-      configuration.indexConcurrency,
-      configuration.initialIndexDepth,
-      this.priorityDirectoriesForWorkspace(workspaceUri),
-      configuration.adaptiveRemoteConcurrency,
-    );
-    this.recordBackendPerformance(workspaceUri, snapshot);
-    return snapshot;
-  }
-
-  private autoPrefersWorkspaceFs(workspaceUri: string): boolean {
-    return prefersWorkspaceFs(workspaceUri, this.backendPerformance);
-  }
-
-  private preferredExternalBackends(
-    workspaceUri: string,
-  ): readonly Exclude<IndexingBackend, 'workspaceFs' | 'auto'>[] {
-    return rankExternalBackends(workspaceUri, this.backendPerformance);
-  }
-
-  private recordBackendPerformance(workspaceUri: string, snapshot: IndexSnapshot): void {
-    if (
-      !snapshot.backend ||
-      snapshot.durationMs === undefined ||
-      snapshot.pathCount === undefined ||
-      snapshot.pathCount === 0
-    ) {
-      return;
-    }
-    updateBackendPerformance(
-      this.backendPerformance,
-      workspaceUri,
-      snapshot.backend,
-      snapshot.durationMs,
-      snapshot.pathCount,
-    );
-    void this.workspaceState
-      ?.update(BACKEND_PERFORMANCE_STORAGE_KEY, this.backendPerformance)
-      .then(undefined, () => undefined);
-  }
-
-  private createEntriesFromExternalPaths(
-    workspaceFolder: vscode.WorkspaceFolder,
-    paths: readonly ScannedExternalPath[],
-  ): PathEntry[] {
-    return paths.map(({ relativePath, kind }) =>
-      this.createEntry(workspaceFolder, relativePath, kind),
-    );
   }
 
   private priorityDirectoriesForWorkspace(workspaceUri: string): ReadonlySet<string> {
@@ -656,69 +535,93 @@ export class PathIndex implements vscode.Disposable {
     return priorityDirectories;
   }
 
-  private cacheFingerprint(configuration: IndexConfiguration): string {
+  private cacheFingerprint(
+    configuration: IndexConfiguration,
+    workspaceFolder: vscode.WorkspaceFolder,
+  ): string {
     return JSON.stringify({
-      version: 3,
-      workspaces: (vscode.workspace.workspaceFolders ?? []).map((folder) => [
-        folder.uri.toString(),
-        folder.name,
-      ]),
+      version: 5,
+      workspace: [workspaceFolder.uri.toString(), workspaceFolder.name],
       excludedNames: [...configuration.excludedNames].sort(),
       excludedFileExtensions: [...configuration.excludedFileExtensions].sort(),
       maxEntries: configuration.maxEntries,
-      indexingBackend: configuration.indexingBackend,
       initialIndexDepth: configuration.initialIndexDepth,
     });
   }
 
   private async restorePersistentIndex(configuration: IndexConfiguration): Promise<boolean> {
-    const cached = await this.persistence.load(
-      this.cacheFingerprint(configuration),
-      configuration.persistentIndexMaxAgeHours,
-    );
-    if (!cached) {
-      return false;
-    }
-
     const requestedGeneration = ++this.generation;
     this.setBuilding(true);
     try {
-      const catalog = new PathSearchCatalog();
-      const cachedWorkspaceMetadata = cached.workspaces.map((workspace) =>
-        createPathWorkspaceMetadata(workspace.name, workspace.uri),
-      );
-      for (let offset = 0; offset < cached.entries.length; offset += CACHE_RESTORE_BATCH_SIZE) {
+      const catalog = new PartitionedPathSearchCatalog();
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      let restoredWorkspaceCount = 0;
+      let restoredLimited = false;
+      let restoredPartial = false;
+      for (const folder of folders) {
         if (requestedGeneration !== this.generation) {
           return false;
         }
-        const batch = cached.entries
-          .slice(offset, offset + CACHE_RESTORE_BATCH_SIZE)
-          .map((cachedEntry) => {
-            const workspace = cached.workspaces[cachedEntry.workspaceIndex];
-            return createCompactPathEntry({
-              kind: cachedEntry.kind,
-              name: cachedEntry.relativePath.slice(
-                cachedEntry.relativePath.lastIndexOf('/') + 1,
-              ),
-              relativePath: cachedEntry.relativePath,
-              workspaceName: workspace.name,
-              workspaceUri: workspace.uri,
-            }, cachedWorkspaceMetadata[cachedEntry.workspaceIndex]);
-          });
-        catalog.addEntries(batch);
-        this.searchCatalog = catalog;
-        this.limited = cached.limited;
-        this.partial = cached.partial;
-        this.changeEmitter.fire();
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        const workspaceUri = folder.uri.toString();
+        const workspaceMetadata = this.workspaceMetadataFor(folder);
+        const partition = new PathSearchCatalog();
+        let installed = false;
+        const cached = await this.persistence.loadBatches(
+          this.cacheFingerprint(configuration, folder),
+          configuration.persistentIndexMaxAgeHours,
+          async (header, cachedEntries) => {
+            if (requestedGeneration !== this.generation) {
+              return false;
+            }
+            const entries = cachedEntries.map((cachedEntry) =>
+              createCompactPathEntry({
+                kind: cachedEntry.kind,
+                name: cachedEntry.relativePath.slice(
+                  cachedEntry.relativePath.lastIndexOf('/') + 1,
+                ),
+                relativePath: cachedEntry.relativePath,
+                workspaceName: folder.name,
+                workspaceUri,
+              }, workspaceMetadata),
+            );
+            partition.addEntries(entries);
+            if (!installed) {
+              catalog.replaceWorkspace(workspaceUri, partition);
+              installed = true;
+            } else {
+              catalog.markWorkspaceChanged();
+            }
+            this.searchCatalog = catalog;
+            restoredLimited ||= header.limited;
+            restoredPartial ||= header.partial;
+            this.limited = restoredLimited;
+            this.partial = restoredPartial;
+            this.changeEmitter.fire();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            return true;
+          },
+          workspaceUri,
+        );
+        if (!cached) {
+          continue;
+        }
+        if (!installed) {
+          catalog.replaceWorkspace(workspaceUri, partition);
+        }
+        partition.seal();
+        restoredWorkspaceCount += 1;
+        restoredLimited ||= cached.limited;
+        restoredPartial ||= cached.partial;
       }
-      catalog.seal();
+      if (restoredWorkspaceCount === 0 || requestedGeneration !== this.generation) {
+        return false;
+      }
       this.searchCatalog = catalog;
-      this.limited = cached.limited;
-      this.partial = cached.partial;
+      this.limited = restoredLimited;
+      this.partial = restoredPartial;
       this.ready = true;
       this.changeEmitter.fire();
-      return true;
+      return restoredWorkspaceCount === folders.length;
     } finally {
       if (requestedGeneration === this.generation) {
         this.setBuilding(false);
@@ -729,6 +632,9 @@ export class PathIndex implements vscode.Disposable {
   private scheduleCacheSave(): void {
     const configuration = this.readConfiguration();
     if (!configuration.persistIndex) {
+      return;
+    }
+    if (this.dirtyWorkspaceUris.size === 0) {
       return;
     }
     if (this.cacheSaveTimer) {
@@ -746,35 +652,41 @@ export class PathIndex implements vscode.Disposable {
       return;
     }
     const folders = vscode.workspace.workspaceFolders ?? [];
-    const workspaceIndexByUri = new Map(
-      folders.map((folder, index) => [folder.uri.toString(), index]),
-    );
-    const catalog = this.searchCatalog;
-    const catalogRevision = catalog.revision;
-    const entries = (function* (): IterableIterator<{
-      workspaceIndex: number;
-      kind: PathEntry['kind'];
-      relativePath: string;
-    }> {
-      for (const entry of catalog.activeEntries()) {
-        const workspaceIndex = workspaceIndexByUri.get(entry.workspaceUri);
-        if (workspaceIndex !== undefined) {
-          yield { workspaceIndex, kind: entry.kind, relativePath: entry.relativePath };
-        }
+    const foldersByUri = new Map(folders.map((folder) => [folder.uri.toString(), folder]));
+    const dirtyWorkspaceUris = [...this.dirtyWorkspaceUris];
+    for (const workspaceUri of dirtyWorkspaceUris) {
+      const folder = foldersByUri.get(workspaceUri);
+      const partition = this.searchCatalog.workspaceCatalog(workspaceUri);
+      if (!folder || !partition) {
+        this.dirtyWorkspaceUris.delete(workspaceUri);
+        continue;
       }
-    })();
-    await this.persistence.save({
-      createdAt: Date.now(),
-      fingerprint: this.cacheFingerprint(configuration),
-      limited: this.limited,
-      partial: this.partial,
-      workspaces: folders.map((folder) => ({
-        uri: folder.uri.toString(),
-        name: folder.name,
-      })),
-      entries,
-    });
-    if (this.searchCatalog !== catalog || catalog.revision !== catalogRevision) {
+      const partitionRevision = partition.revision;
+      const entries = (function* (): IterableIterator<{
+        workspaceIndex: number;
+        kind: PathEntry['kind'];
+        relativePath: string;
+      }> {
+        for (const entry of partition.activeEntries()) {
+          yield { workspaceIndex: 0, kind: entry.kind, relativePath: entry.relativePath };
+        }
+      })();
+      await this.persistence.save({
+        createdAt: Date.now(),
+        fingerprint: this.cacheFingerprint(configuration, folder),
+        limited: this.limited,
+        partial: this.partial,
+        workspaces: [{ uri: workspaceUri, name: folder.name }],
+        entries,
+      }, workspaceUri);
+      if (
+        this.searchCatalog.workspaceCatalog(workspaceUri) === partition &&
+        partition.revision === partitionRevision
+      ) {
+        this.dirtyWorkspaceUris.delete(workspaceUri);
+      }
+    }
+    if (this.dirtyWorkspaceUris.size > 0) {
       this.scheduleCacheSave();
     }
   }
@@ -908,10 +820,6 @@ export class PathIndex implements vscode.Disposable {
       incrementalUpdateBatchLimit: Number.isFinite(configuredBatchLimit)
         ? Math.max(1, Math.floor(configuredBatchLimit))
         : DEFAULT_INCREMENTAL_UPDATE_BATCH_LIMIT,
-      indexingBackend: configuration.get<IndexingBackend>(
-        'indexingBackend',
-        'workspaceFs',
-      ),
       initialIndexDepth: Number.isFinite(configuredInitialDepth)
         ? Math.min(20, Math.max(0, Math.floor(configuredInitialDepth)))
         : 0,
@@ -967,6 +875,7 @@ export class PathIndex implements vscode.Disposable {
             true,
           ) > 0
         ) {
+          this.dirtyWorkspaceUris.add(change.workspaceFolder.uri.toString());
           changed = true;
         }
       }
@@ -1031,6 +940,9 @@ export class PathIndex implements vscode.Disposable {
     // previous path first also handles a file being replaced by a directory.
     const workspaceUri = workspaceFolder.uri.toString();
     const removed = this.searchCatalog.removePath(workspaceUri, relativePath, true);
+    if (removed > 0) {
+      this.dirtyWorkspaceUris.add(workspaceUri);
+    }
     const rootEntry = this.createEntry(
       workspaceFolder,
       relativePath,
@@ -1131,6 +1043,11 @@ export class PathIndex implements vscode.Disposable {
     const accepted =
       remaining >= uniqueEntries.length ? uniqueEntries : uniqueEntries.slice(0, remaining);
     const addedCount = this.searchCatalog.addEntries(accepted);
+    if (addedCount > 0) {
+      for (const entry of accepted) {
+        this.dirtyWorkspaceUris.add(entry.workspaceUri);
+      }
+    }
     if (maxEntries > 0 && this.searchCatalog.size >= maxEntries) {
       this.limited = true;
     }
@@ -1142,11 +1059,12 @@ export class PathIndex implements vscode.Disposable {
   }
 
   private compactCatalog(): void {
-    const activeEntries = this.searchCatalog.activeEntriesSnapshot();
-    const compactedCatalog = new PathSearchCatalog();
-    compactedCatalog.addEntries(activeEntries);
-    compactedCatalog.seal();
-    this.searchCatalog = compactedCatalog;
+    for (const workspaceUri of this.searchCatalog.workspaceUris()) {
+      const workspaceCatalog = this.searchCatalog.workspaceCatalog(workspaceUri);
+      if (workspaceCatalog && workspaceCatalog.tombstoneRatio >= CATALOG_COMPACTION_TOMBSTONE_RATIO) {
+        this.searchCatalog.compactWorkspace(workspaceUri);
+      }
+    }
   }
 
   private createEntry(

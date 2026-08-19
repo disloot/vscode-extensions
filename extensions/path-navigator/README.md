@@ -21,12 +21,18 @@ workspace-relative paths.
 - Cache recent completed queries so returning to one is immediate while the index is unchanged.
 - Reuse matching candidates while a query grows, such as `mai` → `main` → `main.py`.
 - Intersect multiple compact name n-gram posting lists before broad fuzzy fallback.
+- Intersect compact path-segment prefixes for queries such as `//src/comp/but`.
 - Prioritize recently and frequently opened workspace files using workspace-local history.
+- Remember query-to-result selections so repeated searches rank the file you chose before.
 - Pin important files and directories directly from their result-row star button.
-- Restore a streamed compressed index on startup and reconcile it in the background.
+- Restore the compressed index in bounded streaming batches so startup does not duplicate the
+  complete cached path list in memory.
+- Keep a compact catalog per workspace root and replace one partition at a time during refresh;
+  completed and unchanged roots remain searchable throughout the rebuild.
+- Persist each workspace-root partition independently and rewrite only partitions changed by
+  incremental file-system events.
 - Optionally build a shallow initial index and load a directory subtree when it is entered.
-- Optionally accelerate full scans with Git, fd, or ripgrep on the workspace host.
-- Learn measured backend throughput per workspace when `indexingBackend` is `auto`.
+- Use VS Code's native `workspace.fs` API consistently across local, remote, and virtual workspaces.
 - Tune Remote SSH and Dev Container directory-read concurrency without exceeding its configured maximum.
 - Support multi-root, remote, and virtual workspaces through `workspace.fs`.
 
@@ -52,7 +58,8 @@ Prefix the input with `//` when slashes should be part of a global full-path que
 instead of an exact directory scope. For example, `//src/comp/button` can rank
 `src/components/Button.tsx` without completing `src/` and `components/` first.
 
-Large workspaces use compact numeric posting lists and staged candidate retrieval. Candidate
+Large workspaces use a compact structured index: shared workspace metadata, per-root catalogs,
+numeric entry IDs, packed posting lists, name n-grams, and path-segment prefixes. Candidate
 retrieval, reuse, and deduplication remain numeric until the final Top-K paths are displayed.
 A one-character query searches
 recent paths and file-name prefixes. A two-character query searches prefixes and
@@ -126,7 +133,7 @@ the Keyboard Shortcuts editor.
 
 ## Performance settings
 
-- `pathNavigator.maxResults`: maximum visible results (default `200`).
+- `pathNavigator.maxResults`: maximum visible results (default `50`).
 - `pathNavigator.maxIndexEntries`: maximum retained index size (default `500000`,
   or `0` for unlimited). The picker reports when the limit is reached.
 - `pathNavigator.indexConcurrency`: concurrent directory reads from a shared work queue
@@ -138,12 +145,9 @@ the Keyboard Shortcuts editor.
   (default `true`).
 - `pathNavigator.incrementalUpdateBatchLimit`: maximum coalesced file events handled
   incrementally before falling back to a full rebuild (default `2000`).
-- `pathNavigator.indexingBackend`: use portable `workspaceFs` (default), or opt into
-  adaptive `auto`, `git`, `fd`, or `rg`. Auto remembers normalized throughput for each
-  workspace; before measurements exist its external order is `fd → rg → git`.
 - `pathNavigator.initialIndexDepth`: initial `workspace.fs` scan depth (`0` means a
   complete index). Positive values load entered directory subtrees on demand.
-- `pathNavigator.persistIndex`: restore a compressed binary index when reopening a
+- `pathNavigator.persistIndex`: restore a compressed streamed index when reopening a
   workspace (default `true`).
 - `pathNavigator.persistentIndexMaxAgeHours`: maximum cache age (default `168`; `0`
   accepts any age).
@@ -155,10 +159,13 @@ the Keyboard Shortcuts editor.
   (default `150`).
 - `pathNavigator.recentPathsLimit`: workspace-local recent/frequent history
   limit (default `200`, or `0` to disable).
+- `pathNavigator.queryHistoryLimit`: query-to-selected-result history limit
+  (default `500`, or `0` to disable).
 
-The history and persistent index store path metadata only—never file contents. Recent
-history additionally stores timestamps and open counts. It observes workspace files
-opened through the normal editor, not only files opened through Path Navigator.
+The histories and persistent index store path metadata only—never file contents. Recent
+history additionally stores timestamps and open counts; query history stores normalized
+queries and selection counts. Recent history observes workspace files opened through the
+normal editor, not only files opened through Path Navigator.
 
 Common generated directories such as `.venv`, `venv`, `__pycache__`, `.cache`,
 `.pytest_cache`, and `target` are excluded by default. Customize
@@ -170,15 +177,9 @@ or generated trees. Use `pathNavigator.excludeFileExtensions` for suffixes such 
 
 Path Navigator runs as a workspace extension, so Remote SSH, Dev Containers,
 WSL, and Codespaces execute its indexer alongside the workspace. Remote indexes
-are built concurrently and publish partial results while the remaining folders
-are still being scanned. Optional Git/fd/rg commands also run in that remote extension
-host. External command backends are disabled in untrusted workspaces and automatically
-fall back to `workspace.fs`.
-
-`workspaceFs` is the compatibility default and includes empty directories. Git and
-ripgrep derive directories from file paths, so they omit empty directories; Git also
-follows Git ignore rules. Choose `fd` when it is installed and empty-directory discovery
-is important.
+are built concurrently through the native `workspace.fs` provider and include empty
+directories. The same implementation is used for local folders, Remote SSH, Dev
+Containers, WSL, Codespaces, and virtual workspaces.
 
 To test a local VSIX, first connect to the remote environment, then run
 **Extensions: Install from VSIX...** in that remote window and reload it. Use
@@ -209,10 +210,16 @@ From the repository root, run:
 npm install
 npm run check --workspace extensions/path-navigator
 npm test --workspace extensions/path-navigator
+npm run test:integration --workspace extensions/path-navigator
 npm run benchmark --workspace extensions/path-navigator
-npm run benchmark:backends --workspace extensions/path-navigator -- --synthetic 50000
+npm run package:path-navigator
 npm test
 ```
+
+The integration suite launches an isolated VS Code Extension Host and verifies both a local
+workspace and a provider-backed remote/virtual workspace through the real `workspace.fs` API.
+The package command disables npm dependency discovery because the extension has no runtime
+dependencies and otherwise `vsce` can traverse the parent npm workspace.
 
 Press F5 in VS Code to launch an Extension Development Host.
 

@@ -1,5 +1,5 @@
 import type { PathEntry } from './pathEntry';
-import { PathSearchCatalog, type PathEntryId } from './pathSearchCatalog';
+import type { PathEntryId, PathSearchIndex } from './pathSearchCatalog';
 import { pathIdentity } from './resultSelection';
 import {
   isDescendantOfScope,
@@ -15,6 +15,7 @@ export interface PathUsage {
   readonly lastOpenedAt: number;
   readonly openCount: number;
   readonly pinned?: boolean;
+  readonly queryAffinity?: number;
 }
 
 export interface PathSearchProgress {
@@ -31,7 +32,7 @@ export interface PathSearchReuse {
 }
 
 export interface PathSearchRequest {
-  readonly catalog: PathSearchCatalog;
+  readonly catalog: PathSearchIndex;
   readonly scopePath: string;
   readonly query: string;
   readonly workspaceUri?: string;
@@ -62,7 +63,11 @@ function usageScoreBoost(usage: PathUsage, now: number): number {
   const frequencyBoost = Math.min(180, Math.log2(usage.openCount + 1) * 40);
   const ageInDays = Math.max(0, now - usage.lastOpenedAt) / 86_400_000;
   const recencyBoost = Math.max(0, 120 - ageInDays * 10);
-  return pinnedBoost + Math.min(300, frequencyBoost + recencyBoost);
+  const queryAffinityBoost = Math.min(
+    2_500,
+    Math.log2((usage.queryAffinity ?? 0) + 1) * 1_200,
+  );
+  return pinnedBoost + Math.min(300, frequencyBoost + recencyBoost) + queryAffinityBoost;
 }
 
 function candidateQueryForRequest(normalizedQuery: string, globalPathQuery: boolean): string {
@@ -82,8 +87,10 @@ function* combineCandidates(
 }
 
 function candidateSources(
-  catalog: PathSearchCatalog,
+  catalog: PathSearchIndex,
   normalizedQuery: string,
+  normalizedFullQuery: string,
+  globalPathQuery: boolean,
   scopePath: string,
   workspaceUri?: string,
   reuse?: PathSearchReuse,
@@ -112,6 +119,9 @@ function candidateSources(
   }
   return [
     ...reusedSources,
+    ...(globalPathQuery
+      ? [catalog.pathSegmentCandidateIds(normalizedFullQuery, workspaceUri)]
+      : []),
     catalog.exactNameCandidateIds(normalizedQuery, workspaceUri),
     catalog.prefixCandidateIds(normalizedQuery, workspaceUri),
     catalog.intersectingNgramCandidateIds(normalizedQuery, workspaceUri),
@@ -165,7 +175,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
   );
   const normalizedScope = normalizeSearchText(request.scopePath).replace(/\/$/, '');
   const ranker = new TopKPathRanker<PathEntry>(request.maxResults);
-  const seenEntryIds = new Uint8Array(request.catalog.capacity);
+  const seenEntryIds = new Set<PathEntryId>();
   const reusableCandidateIds: PathEntryId[] = [];
   const now = request.now ?? Date.now();
   let inspectedCandidates = 0;
@@ -206,7 +216,7 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       continue;
     }
     if (entryId !== undefined) {
-      seenEntryIds[entryId] = 1;
+      seenEntryIds.add(entryId);
     }
     ranker.consider(entry, score + usageScoreBoost(usage, now));
     if (entryId !== undefined) {
@@ -242,6 +252,8 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
   const sources = candidateSources(
     request.catalog,
     normalizedCandidateQuery,
+    normalizedQuery,
+    request.globalPathQuery === true,
     request.scopePath,
     request.workspaceUri,
     request.reuse,
@@ -274,10 +286,10 @@ export async function searchPaths(request: PathSearchRequest): Promise<void> {
       }
     }
 
-    if (seenEntryIds[entryId] !== 0) {
+    if (seenEntryIds.has(entryId)) {
       continue;
     }
-    seenEntryIds[entryId] = 1;
+    seenEntryIds.add(entryId);
     const entry = request.catalog.getEntryById(entryId);
     if (!entry || !entryKindIsIncluded(entry, request)) {
       continue;

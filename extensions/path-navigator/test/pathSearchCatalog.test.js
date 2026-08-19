@@ -1,6 +1,9 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { PathSearchCatalog } = require('../dist/pathSearchCatalog');
+const {
+  PartitionedPathSearchCatalog,
+  PathSearchCatalog,
+} = require('../dist/pathSearchCatalog');
 
 function entry(relativePath, kind = 'file', workspaceUri = 'file:///workspace') {
   return {
@@ -146,4 +149,50 @@ test('numeric candidate APIs preserve the same candidate membership', () => {
     paths(catalog.intersectingNgramCandidates('main')),
   );
   assert.equal(catalog.capacity, 3);
+});
+
+test('path segment candidates intersect compact prefixes across a complete path', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('src/components/Button.tsx'),
+    entry('test/components/Button.tsx'),
+    entry('src/services/Button.tsx'),
+  ]);
+
+  const matches = [...catalog.pathSegmentCandidateIds('src/comp/but')]
+    .map((id) => catalog.getEntryById(id).relativePath);
+  assert.deepEqual(matches, ['src/components/Button.tsx']);
+});
+
+test('path segment candidates support one- and two-character segment prefixes', () => {
+  const catalog = new PathSearchCatalog();
+  catalog.addEntries([
+    entry('src/components/Button.tsx'),
+    entry('src/services/Button.tsx'),
+  ]);
+
+  const matches = [...catalog.pathSegmentCandidateIds('s/co/bu')]
+    .map((id) => catalog.getEntryById(id).relativePath);
+  assert.deepEqual(matches, ['src/components/Button.tsx']);
+});
+
+test('partition replacement is atomic and leaves other workspaces searchable', () => {
+  const catalog = new PartitionedPathSearchCatalog();
+  const alpha = new PathSearchCatalog();
+  const beta = new PathSearchCatalog();
+  alpha.addEntries([entry('src/old.ts', 'file', 'file:///alpha')]);
+  beta.addEntries([entry('src/stable.ts', 'file', 'file:///beta')]);
+  catalog.replaceWorkspace('file:///alpha', alpha);
+  catalog.replaceWorkspace('file:///beta', beta);
+  const oldAlphaId = catalog.getEntryId('file:///alpha\0file\0src/old.ts');
+
+  const replacement = new PathSearchCatalog();
+  replacement.addEntries([entry('src/new.ts', 'file', 'file:///alpha')]);
+  catalog.replaceWorkspace('file:///alpha', replacement);
+
+  assert.equal(catalog.getEntryById(oldAlphaId), undefined);
+  assert.equal(catalog.getEntryByPath('file:///alpha', 'src/old.ts'), undefined);
+  assert.equal(catalog.getEntryByPath('file:///alpha', 'src/new.ts').name, 'new.ts');
+  assert.equal(catalog.getEntryByPath('file:///beta', 'src/stable.ts').name, 'stable.ts');
+  assert.equal([...catalog.workspaceCandidateIds()].length, 2);
 });
